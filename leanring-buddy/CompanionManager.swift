@@ -68,9 +68,11 @@ final class CompanionManager: ObservableObject {
     // Response text is now displayed inline on the cursor overlay via
     // streamingResponseText, so no separate response overlay manager is needed.
 
-    /// Base URL for the Cloudflare Worker proxy. All API requests route
-    /// through this so keys never ship in the app binary.
-    private static let workerBaseURL = "https://your-worker-name.your-subdomain.workers.dev"
+    /// Base URL for the brain proxy. Points at the local clicky-max-proxy
+    /// (~/Developer/clicky-max-proxy) so /chat runs on a Claude Max subscription
+    /// with no API key. LOCAL-ONLY: do not ship or PR this — the upstream value
+    /// is the Cloudflare Worker URL.
+    private static let workerBaseURL = "http://127.0.0.1:8787"
 
     private lazy var claudeAPI: ClaudeAPI = {
         return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
