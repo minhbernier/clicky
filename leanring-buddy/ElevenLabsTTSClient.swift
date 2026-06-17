@@ -11,7 +11,7 @@ import AVFoundation
 import Foundation
 
 @MainActor
-final class ElevenLabsTTSClient {
+final class ElevenLabsTTSClient: BuddyTextToSpeechClient {
     private let proxyURL: URL
     private let session: URLSession
 

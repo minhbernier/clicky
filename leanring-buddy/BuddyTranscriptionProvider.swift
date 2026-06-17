@@ -34,6 +34,7 @@ enum BuddyTranscriptionProviderFactory {
         case assemblyAI = "assemblyai"
         case openAI = "openai"
         case appleSpeech = "apple"
+        case parakeet = "parakeet"
     }
 
     static func makeDefaultProvider() -> any BuddyTranscriptionProvider {
@@ -53,6 +54,13 @@ enum BuddyTranscriptionProviderFactory {
 
         if preferredProvider == .appleSpeech {
             return AppleSpeechTranscriptionProvider()
+        }
+
+        // Parakeet is a pure on-device provider that self-downloads its model,
+        // so honor the explicit selection directly (like Apple Speech) rather
+        // than falling back when the model isn't loaded yet.
+        if preferredProvider == .parakeet {
+            return ParakeetTranscriptionProvider()
         }
 
         if preferredProvider == .assemblyAI {

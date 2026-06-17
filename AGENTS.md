@@ -15,8 +15,8 @@ All API keys live on a Cloudflare Worker proxy — nothing sensitive ships in th
 - **Framework**: SwiftUI (macOS native) with AppKit bridging for menu bar panel and cursor overlay
 - **Pattern**: MVVM with `@StateObject` / `@Published` state management
 - **AI Chat**: Claude (Sonnet 4.6 default, Opus 4.6 optional) via Cloudflare Worker proxy with SSE streaming
-- **Speech-to-Text**: AssemblyAI real-time streaming (`u3-rt-pro` model) via websocket, with OpenAI and Apple Speech as fallbacks
-- **Text-to-Speech**: ElevenLabs (`eleven_flash_v2_5` model) via Cloudflare Worker proxy
+- **Speech-to-Text**: AssemblyAI real-time streaming (`u3-rt-pro` model) via websocket, with OpenAI, Apple Speech, and on-device NVIDIA Parakeet (via FluidAudio) as alternatives
+- **Text-to-Speech**: ElevenLabs (`eleven_flash_v2_5` model) via Cloudflare Worker proxy, with on-device `AVSpeechSynthesizer` as an offline alternative
 - **Screen Capture**: ScreenCaptureKit (macOS 14.2+), multi-monitor support
 - **Voice Input**: Push-to-talk via `AVAudioEngine` + pluggable transcription-provider layer. System-wide keyboard shortcut via listen-only CGEvent tap.
 - **Element Pointing**: Claude embeds `[POINT:x,y:label:screenN]` tags in responses. The overlay parses these, maps coordinates to the correct monitor, and animates the blue cursor along a bezier arc to the target.
@@ -35,6 +35,17 @@ The app never calls external APIs directly. All requests go through a Cloudflare
 
 Worker secrets: `ANTHROPIC_API_KEY`, `ASSEMBLYAI_API_KEY`, `ELEVENLABS_API_KEY`
 Worker vars: `ELEVENLABS_VOICE_ID`
+
+### Offline Voice Mode (on-device STT + TTS)
+
+The ears (STT) and mouth (TTS) can each run fully on-device. The Claude "brain" still requires the network. Both are selected at runtime via Info.plist keys; defaults preserve the shipped cloud behavior.
+
+| Info.plist key | Values | Default | Effect |
+|----------------|--------|---------|--------|
+| `VoiceTranscriptionProvider` | `assemblyai`, `openai`, `apple`, `parakeet` | `assemblyai` | `parakeet` = on-device NVIDIA Parakeet via FluidAudio |
+| `VoiceTTSProvider` | `elevenlabs`, `system` | `elevenlabs` | `system` = on-device `AVSpeechSynthesizer` |
+
+The Parakeet provider depends on the **FluidAudio** SwiftPM package (`https://github.com/FluidInference/FluidAudio`, pinned to `0.15.4`), added to the `leanring-buddy` target. It downloads its CoreML model from Hugging Face on first run and caches it; the first transcription after a fresh install may lag while the model loads.
 
 ### Key Architecture Decisions
 
@@ -60,15 +71,18 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 | `CompanionResponseOverlay.swift` | ~217 | SwiftUI view for the response text bubble and waveform displayed next to the cursor in the overlay. |
 | `CompanionScreenCaptureUtility.swift` | ~132 | Multi-monitor screenshot capture using ScreenCaptureKit. Returns labeled image data for each connected display. |
 | `BuddyDictationManager.swift` | ~866 | Push-to-talk voice pipeline. Handles microphone capture via `AVAudioEngine`, provider-aware permission checks, keyboard/button dictation sessions, transcript finalization, shortcut parsing, contextual keyterms, and live audio-level reporting for waveform feedback. |
-| `BuddyTranscriptionProvider.swift` | ~100 | Protocol surface and provider factory for voice transcription backends. Resolves provider based on `VoiceTranscriptionProvider` in Info.plist — AssemblyAI, OpenAI, or Apple Speech. |
+| `BuddyTranscriptionProvider.swift` | ~110 | Protocol surface and provider factory for voice transcription backends. Resolves provider based on `VoiceTranscriptionProvider` in Info.plist — AssemblyAI, OpenAI, Apple Speech, or Parakeet. |
 | `AssemblyAIStreamingTranscriptionProvider.swift` | ~478 | Streaming transcription provider. Fetches temp tokens from the Cloudflare Worker, opens an AssemblyAI v3 websocket, streams PCM16 audio, tracks turn-based transcripts, and delivers finalized text on key-up. Shares a single URLSession across all sessions. |
 | `OpenAIAudioTranscriptionProvider.swift` | ~317 | Upload-based transcription provider. Buffers push-to-talk audio locally, uploads as WAV on release, returns finalized transcript. |
 | `AppleSpeechTranscriptionProvider.swift` | ~147 | Local fallback transcription provider backed by Apple's Speech framework. |
+| `ParakeetTranscriptionProvider.swift` | ~330 | On-device transcription provider running NVIDIA Parakeet (TDT) on the Apple Neural Engine via the FluidAudio SwiftPM package. Buffers PCM16 like the OpenAI provider, then transcribes the whole utterance locally — no network, no speech-recognition entitlement. Includes `ParakeetSpeechModelLoader`, which downloads/loads the CoreML model once and shares the `AsrManager`. |
 | `BuddyAudioConversionSupport.swift` | ~108 | Audio conversion helpers. Converts live mic buffers to PCM16 mono audio and builds WAV payloads for upload-based providers. |
 | `GlobalPushToTalkShortcutMonitor.swift` | ~132 | System-wide push-to-talk monitor. Owns the listen-only `CGEvent` tap and publishes press/release transitions. |
 | `ClaudeAPI.swift` | ~291 | Claude vision API client with streaming (SSE) and non-streaming modes. TLS warmup optimization, image MIME detection, conversation history support. |
 | `OpenAIAPI.swift` | ~142 | OpenAI GPT vision API client. |
-| `ElevenLabsTTSClient.swift` | ~81 | ElevenLabs TTS client. Sends text to the Worker proxy, plays back audio via `AVAudioPlayer`. Exposes `isPlaying` for transient cursor scheduling. |
+| `ElevenLabsTTSClient.swift` | ~81 | ElevenLabs TTS client. Sends text to the Worker proxy, plays back audio via `AVAudioPlayer`. Exposes `isPlaying` for transient cursor scheduling. Conforms to `BuddyTextToSpeechClient`. |
+| `BuddyTextToSpeechClient.swift` | ~52 | Protocol surface and factory for text-to-speech backends. Resolves the active client based on `VoiceTTSProvider` in Info.plist — ElevenLabs (default) or on-device system speech. |
+| `SystemSpeechTTSClient.swift` | ~110 | On-device TTS client backed by macOS-native `AVSpeechSynthesizer`. Fully offline, no API key. Bridges the delegate callbacks to async and mirrors `ElevenLabsTTSClient`'s return-on-start contract. |
 | `ElementLocationDetector.swift` | ~335 | Detects UI element locations in screenshots for cursor pointing. |
 | `DesignSystem.swift` | ~880 | Design system tokens — colors, corner radii, shared styles. All UI references `DS.Colors`, `DS.CornerRadius`, etc. |
 | `ClickyAnalytics.swift` | ~121 | PostHog analytics integration for usage tracking. |
