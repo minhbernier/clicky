@@ -76,9 +76,42 @@ final class SystemSpeechTTSClient: NSObject, BuddyTextToSpeechClient {
     }
 
     private static func preferredEnglishVoice() -> AVSpeechSynthesisVoice? {
-        // Match the English-centric transcription the rest of the app assumes.
-        // Falls back to the system default voice if en-US isn't installed.
-        AVSpeechSynthesisVoice(language: "en-US")
+        // 1) Explicit override: set `SystemTTSVoiceIdentifier` in Info.plist to a
+        //    voice identifier from AVSpeechSynthesisVoice.speechVoices().
+        if let overrideIdentifier = Bundle.main.object(forInfoDictionaryKey: "SystemTTSVoiceIdentifier") as? String,
+           let overrideVoice = AVSpeechSynthesisVoice(identifier: overrideIdentifier) {
+            return overrideVoice
+        }
+
+        let englishVoices = AVSpeechSynthesisVoice.speechVoices()
+            .filter { $0.language.hasPrefix("en") }
+            // Drop the novelty/robotic voices (Zarvox, Bells, Bubbles, ...).
+            .filter { !$0.identifier.hasPrefix("com.apple.speech.synthesis.voice.") }
+
+        // 2) Pick the most natural voice available, ranked by:
+        //    audio quality (premium > enhanced > default), then a curated list of
+        //    known-good natural voice names, then US English. Downloading a
+        //    Premium or Siri voice in System Settings is picked up automatically.
+        let preferredNaturalNames = ["Siri", "Ava", "Zoe", "Allison", "Samantha", "Nicky", "Tom", "Aaron", "Evan", "Joelle"]
+        func naturalNameRank(_ voice: AVSpeechSynthesisVoice) -> Int {
+            if let index = preferredNaturalNames.firstIndex(where: { voice.name.localizedCaseInsensitiveContains($0) }) {
+                return preferredNaturalNames.count - index
+            }
+            return 0
+        }
+
+        let bestVoice = englishVoices.max { lhs, rhs in
+            if lhs.quality.rawValue != rhs.quality.rawValue {
+                return lhs.quality.rawValue < rhs.quality.rawValue
+            }
+            if naturalNameRank(lhs) != naturalNameRank(rhs) {
+                return naturalNameRank(lhs) < naturalNameRank(rhs)
+            }
+            // Prefer US English on ties.
+            return (lhs.language == "en-US" ? 1 : 0) < (rhs.language == "en-US" ? 1 : 0)
+        }
+
+        return bestVoice ?? AVSpeechSynthesisVoice(language: "en-US")
     }
 }
 

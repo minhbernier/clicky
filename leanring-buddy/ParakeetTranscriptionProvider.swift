@@ -240,7 +240,14 @@ private final class ParakeetTranscriptionSession: BuddyStreamingTranscriptionSes
     }
 
     deinit {
-        cancel()
+        // Cancel the in-flight transcription Task directly. We must NOT call
+        // cancel() here: its stateQueue.async closure strongly captures `self`,
+        // which retains an object already at refcount zero while it is being
+        // deallocated. That resurrection traps the Swift runtime with abort()
+        // and crashes the whole app when a session deallocates after push-to-talk.
+        // The Task already uses [weak self], so cancelling it is enough; the
+        // buffered-state cleanup cancel() does is moot once the object is gone.
+        transcriptionTask?.cancel()
     }
 }
 

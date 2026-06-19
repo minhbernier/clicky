@@ -181,6 +181,9 @@ final class CompanionManager: ObservableObject {
     func start() {
         refreshAllPermissions()
         print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
+        // Ask for everything we need up front, the moment the app opens, instead
+        // of waiting for the user's first push-to-talk to surface the prompts.
+        requestAllNeededPermissionsOnLaunch()
         startPermissionPolling()
         bindVoiceStateObservation()
         bindAudioPowerLevel()
@@ -402,6 +405,24 @@ final class CompanionManager: ObservableObject {
     }
 
     // MARK: - Private
+
+    /// Fires the system permission prompts for everything the companion needs —
+    /// Microphone, Accessibility, and Screen Recording — right at launch, so the
+    /// user is asked up front instead of on their first push-to-talk. Each
+    /// request no-ops when that permission is already granted; the per-launch
+    /// guards in WindowPositionManager fall back to opening System Settings on
+    /// later attempts once macOS has shown its one-time prompt.
+    private func requestAllNeededPermissionsOnLaunch() {
+        if !hasMicrophonePermission {
+            promptForMicrophoneIfNotDetermined()
+        }
+        if !hasAccessibilityPermission {
+            WindowPositionManager.requestAccessibilityPermission()
+        }
+        if !hasScreenRecordingPermission {
+            WindowPositionManager.requestScreenRecordingPermission()
+        }
+    }
 
     /// Triggers the system microphone prompt if the user has never been asked.
     /// Once granted/denied the status sticks and polling picks it up.
