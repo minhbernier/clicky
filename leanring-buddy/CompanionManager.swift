@@ -78,6 +78,21 @@ final class CompanionManager: ObservableObject {
     /// True while a voice follow-up dictation session (started from a tab button,
     /// not the hardware shortcut) is recording. Drives the Voice button's UI.
     @Published private(set) var isRecordingVoiceFollowUp = false
+
+    /// Forwards the agent task store's changes to this manager's observers.
+    /// SwiftUI views (the menu bar Agents tab and the right-side task panel)
+    /// observe CompanionManager, but the tasks live in the nested
+    /// `agentTaskStore` ObservableObject — without re-broadcasting its changes
+    /// here, those views would not re-render when a task's status or transcript
+    /// updates.
+    private var agentTaskStoreChangeCancellable: AnyCancellable?
+
+    init() {
+        agentTaskStoreChangeCancellable = agentTaskStore.objectWillChange
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+    }
     // Response text is now displayed inline on the cursor overlay via
     // streamingResponseText, so no separate response overlay manager is needed.
 
