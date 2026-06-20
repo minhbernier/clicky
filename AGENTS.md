@@ -43,8 +43,11 @@ The ears (STT) and mouth (TTS) can each run fully on-device. The Claude "brain" 
 | Info.plist key | Values | Default | Effect |
 |----------------|--------|---------|--------|
 | `VoiceTranscriptionProvider` | `assemblyai`, `openai`, `apple`, `parakeet` | `assemblyai` | `parakeet` = on-device NVIDIA Parakeet via FluidAudio |
-| `VoiceTTSProvider` | `elevenlabs`, `system` | `elevenlabs` | `system` = on-device `AVSpeechSynthesizer` |
+| `VoiceTTSProvider` | `elevenlabs`, `system`, `openai` | `elevenlabs` | `system` = on-device `AVSpeechSynthesizer`; `openai` = OpenAI `/v1/audio/speech` (needs `OpenAIAPIKey`, falls back to `system` if the key is missing) |
 | `SystemTTSVoiceIdentifier` | an `AVSpeechSynthesisVoice` identifier | _(auto)_ | Overrides the auto-picked system voice (premium > enhanced > curated default) when `VoiceTTSProvider=system` |
+| `OpenAIAPIKey` | an OpenAI API key (`sk-…`) | _(none)_ | Used by OpenAI TTS (`VoiceTTSProvider=openai`) and OpenAI STT (`VoiceTranscriptionProvider=openai`); calls `api.openai.com` directly |
+| `OpenAITTSVoice` | alloy, ash, ballad, coral, echo, fable, nova, onyx, sage, shimmer | `alloy` | The OpenAI TTS voice when `VoiceTTSProvider=openai` |
+| `OpenAITTSModel` | `gpt-4o-mini-tts`, `tts-1`, `tts-1-hd` | `gpt-4o-mini-tts` | The OpenAI TTS model when `VoiceTTSProvider=openai` |
 | `FarzaOnboardingEnabled` | `YES`/`NO` | `NO` | Plays the upstream Farza intro video + theme music during onboarding. Off by default for the Micky fork (onboarding is effectively skipped — the cursor just appears) |
 
 The Parakeet provider depends on the **FluidAudio** SwiftPM package (`https://github.com/FluidInference/FluidAudio`, pinned to `0.15.4`), added to the `leanring-buddy` target. It downloads its CoreML model from Hugging Face on first run and caches it; the first transcription after a fresh install may lag while the model loads.
@@ -92,6 +95,7 @@ The Parakeet provider depends on the **FluidAudio** SwiftPM package (`https://gi
 | `ElevenLabsTTSClient.swift` | ~81 | ElevenLabs TTS client. Sends text to the Worker proxy, plays back audio via `AVAudioPlayer`. Exposes `isPlaying` for transient cursor scheduling. Conforms to `BuddyTextToSpeechClient`. |
 | `BuddyTextToSpeechClient.swift` | ~52 | Protocol surface and factory for text-to-speech backends. Resolves the active client based on `VoiceTTSProvider` in Info.plist — ElevenLabs (default) or on-device system speech. |
 | `SystemSpeechTTSClient.swift` | ~110 | On-device TTS client backed by macOS-native `AVSpeechSynthesizer`. Fully offline, no API key. Bridges the delegate callbacks to async and mirrors `ElevenLabsTTSClient`'s return-on-start contract. |
+| `OpenAITextToSpeechClient.swift` | ~95 | TTS client backed by OpenAI's `/v1/audio/speech`. Calls `api.openai.com` directly with `OpenAIAPIKey` (independent of the brain proxy), plays the MP3 via `AVAudioPlayer`, and mirrors `ElevenLabsTTSClient`'s return-on-start contract. Selected via `VoiceTTSProvider=openai`. |
 | `ElementLocationDetector.swift` | ~335 | Detects UI element locations in screenshots for cursor pointing. |
 | `DesignSystem.swift` | ~880 | Design system tokens — colors, corner radii, shared styles. All UI references `DS.Colors`, `DS.CornerRadius`, etc. |
 | `ClickyAnalytics.swift` | ~121 | PostHog analytics integration for usage tracking. |

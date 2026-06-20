@@ -29,7 +29,14 @@ enum BuddyTextToSpeechClientFactory {
     private enum PreferredProvider: String {
         case elevenLabs = "elevenlabs"
         case systemSpeech = "system"
+        case openAI = "openai"
     }
+
+    /// OpenAI TTS defaults, overridable via Info.plist (`OpenAITTSVoice`,
+    /// `OpenAITTSModel`). Voices: alloy, ash, ballad, coral, echo, fable, nova,
+    /// onyx, sage, shimmer.
+    private static let defaultOpenAITTSVoice = "alloy"
+    private static let defaultOpenAITTSModel = "gpt-4o-mini-tts"
 
     /// Resolves the active TTS client from the `VoiceTTSProvider` Info.plist key.
     /// When the key is absent or unrecognized, defaults to ElevenLabs so the
@@ -42,6 +49,21 @@ enum BuddyTextToSpeechClientFactory {
 
         if preferredProvider == .systemSpeech {
             print("🔊 TTS: using on-device system speech (AVSpeechSynthesizer)")
+            return SystemSpeechTTSClient()
+        }
+
+        if preferredProvider == .openAI {
+            // OpenAI TTS calls api.openai.com directly with an API key. If the key
+            // is missing, fall back to on-device system speech rather than
+            // ElevenLabs (which the local brain proxy can't serve), so the app
+            // still talks.
+            if let openAIAPIKey = AppBundleConfiguration.stringValue(forKey: "OpenAIAPIKey") {
+                let voice = AppBundleConfiguration.stringValue(forKey: "OpenAITTSVoice") ?? defaultOpenAITTSVoice
+                let model = AppBundleConfiguration.stringValue(forKey: "OpenAITTSModel") ?? defaultOpenAITTSModel
+                print("🔊 TTS: using OpenAI (voice=\(voice), model=\(model))")
+                return OpenAITextToSpeechClient(apiKey: openAIAPIKey, voice: voice, model: model)
+            }
+            print("⚠️ TTS: VoiceTTSProvider=openai but OpenAIAPIKey is missing — falling back to on-device system speech")
             return SystemSpeechTTSClient()
         }
 
