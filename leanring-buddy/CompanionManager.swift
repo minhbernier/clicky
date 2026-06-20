@@ -65,6 +65,19 @@ final class CompanionManager: ObservableObject {
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
+
+    /// Centralized store of agent tasks shown in the right-side task panel and
+    /// the Agents tab. Lives here so task state is shared across all panels.
+    let agentTaskStore = AgentTaskStore()
+
+    /// When the user starts a voice follow-up from the Agents tab, this holds
+    /// the task that the next push-to-talk transcript should be attached to.
+    /// Consumed (cleared) once that transcript is sent.
+    private var pendingVoiceFollowUpAgentTaskID: UUID?
+
+    /// True while a voice follow-up dictation session (started from a tab button,
+    /// not the hardware shortcut) is recording. Drives the Voice button's UI.
+    @Published private(set) var isRecordingVoiceFollowUp = false
     // Response text is now displayed inline on the cursor overlay via
     // streamingResponseText, so no separate response overlay manager is needed.
 
@@ -553,10 +566,19 @@ final class CompanionManager: ObservableObject {
                         // Partial transcripts are hidden (waveform-only UI)
                     },
                     submitDraftText: { [weak self] finalTranscript in
-                        self?.lastTranscript = finalTranscript
+                        guard let self else { return }
+                        self.lastTranscript = finalTranscript
                         print("🗣️ Companion received transcript: \(finalTranscript)")
                         ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
-                        self?.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
+                        // If this transcript is a voice follow-up to a specific
+                        // task, attach it to that task; otherwise let the send
+                        // path decide whether it's a new agent task.
+                        let followUpAgentTaskID = self.pendingVoiceFollowUpAgentTaskID
+                        self.pendingVoiceFollowUpAgentTaskID = nil
+                        self.sendTranscriptToClaudeWithScreenshot(
+                            transcript: finalTranscript,
+                            associatedAgentTaskID: followUpAgentTaskID
+                        )
                     }
                 )
             }
@@ -618,9 +640,32 @@ final class CompanionManager: ObservableObject {
     /// in the spinner/processing state until TTS audio begins playing.
     /// Claude's response may include a [POINT:x,y:label] tag which triggers
     /// the buddy to fly to that element on screen.
-    private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
+    private func sendTranscriptToClaudeWithScreenshot(
+        transcript: String,
+        associatedAgentTaskID: UUID? = nil
+    ) {
         currentResponseTask?.cancel()
         textToSpeechClient.stopPlayback()
+
+        // Resolve which agent task (if any) this turn belongs to:
+        //  - an explicit follow-up target wins,
+        //  - otherwise a request that reads like a multi-step/power job spawns a
+        //    new task card,
+        //  - plain screen questions get no card.
+        let effectiveAgentTaskID: UUID? = {
+            if let associatedAgentTaskID {
+                agentTaskStore.appendUserMessage(transcript, toTaskWithID: associatedAgentTaskID)
+                agentTaskStore.updateStatus(.running, forTaskWithID: associatedAgentTaskID)
+                return associatedAgentTaskID
+            }
+            if AgentTaskClassifier.looksLikeAgentTask(transcript) {
+                return agentTaskStore.createAgentTask(
+                    title: AgentTaskClassifier.makeTitle(from: transcript),
+                    initialUserMessage: transcript
+                )
+            }
+            return nil
+        }()
 
         currentResponseTask = Task {
             // Stay in processing (spinner) state — no streaming text displayed
@@ -732,6 +777,18 @@ final class CompanionManager: ObservableObject {
 
                 ClickyAnalytics.trackAIResponseReceived(response: spokenText)
 
+                // Record the agent's reply on its task card and update its status.
+                // If the reply reads like a "describe the action, then ask the
+                // user to say yes" confirmation prompt (the proxy's power gate),
+                // mark it Needs confirmation so the card reflects that it's waiting.
+                if let effectiveAgentTaskID {
+                    agentTaskStore.appendAssistantMessage(spokenText, toTaskWithID: effectiveAgentTaskID)
+                    let resolvedStatus: AgentTaskStatus = Self.responseAsksForConfirmation(spokenText)
+                        ? .needsConfirmation
+                        : .done
+                    agentTaskStore.updateStatus(resolvedStatus, forTaskWithID: effectiveAgentTaskID)
+                }
+
                 // Play the response via TTS. Keep the spinner (processing state)
                 // until the audio actually starts playing, then switch to responding.
                 if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -750,6 +807,9 @@ final class CompanionManager: ObservableObject {
             } catch {
                 ClickyAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
+                if let effectiveAgentTaskID {
+                    agentTaskStore.updateStatus(.error, forTaskWithID: effectiveAgentTaskID)
+                }
                 speakCreditsErrorFallback()
             }
 
@@ -758,6 +818,85 @@ final class CompanionManager: ObservableObject {
                 scheduleTransientHideIfNeeded()
             }
         }
+    }
+
+    // MARK: - Agent Task Follow-Ups
+
+    /// Sends a typed follow-up message to an existing agent task through the same
+    /// /chat path the voice pipeline uses (with a fresh screenshot for context).
+    /// Used by the right-side panel's "follow up with agent…" field and the
+    /// Agents tab's Text button.
+    func sendFollowUpText(_ text: String, toAgentTaskID agentTaskID: UUID?) {
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedText.isEmpty else { return }
+        lastTranscript = trimmedText
+        ClickyAnalytics.trackUserMessageSent(transcript: trimmedText)
+        sendTranscriptToClaudeWithScreenshot(
+            transcript: trimmedText,
+            associatedAgentTaskID: agentTaskID
+        )
+    }
+
+    /// Starts (or stops) a voice follow-up dictation session bound to a specific
+    /// agent task, driven by the Agents tab's Voice button rather than the
+    /// hardware push-to-talk shortcut. The resulting transcript is attached to
+    /// the given task when it finalizes.
+    func toggleVoiceFollowUp(forAgentTaskID agentTaskID: UUID?) {
+        // If a follow-up dictation is already running, stop it (toggle off).
+        if isRecordingVoiceFollowUp {
+            buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+            isRecordingVoiceFollowUp = false
+            return
+        }
+
+        // Don't start if another dictation (e.g. the hardware shortcut) is busy.
+        guard !buddyDictationManager.isDictationInProgress else { return }
+
+        pendingVoiceFollowUpAgentTaskID = agentTaskID
+        isRecordingVoiceFollowUp = true
+
+        // Bring the cursor overlay up transiently so the waveform is visible,
+        // matching the hardware push-to-talk experience.
+        if !isOverlayVisible {
+            overlayWindowManager.hasShownOverlayBefore = true
+            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+            isOverlayVisible = true
+        }
+
+        Task {
+            await buddyDictationManager.startPushToTalkFromKeyboardShortcut(
+                currentDraftText: "",
+                updateDraftText: { _ in
+                    // Partial transcripts are hidden (waveform-only UI).
+                },
+                submitDraftText: { [weak self] finalTranscript in
+                    guard let self else { return }
+                    self.isRecordingVoiceFollowUp = false
+                    self.lastTranscript = finalTranscript
+                    let followUpAgentTaskID = self.pendingVoiceFollowUpAgentTaskID
+                    self.pendingVoiceFollowUpAgentTaskID = nil
+                    ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
+                    self.sendTranscriptToClaudeWithScreenshot(
+                        transcript: finalTranscript,
+                        associatedAgentTaskID: followUpAgentTaskID
+                    )
+                }
+            )
+        }
+    }
+
+    /// Heuristic: does this reply read like the power gate's "describe the action,
+    /// then ask the user to say yes" confirmation prompt? The proxy instructs the
+    /// model to do exactly this before any mutating action, so a reply that both
+    /// asks a question and invites a yes/confirmation is treated as pending.
+    static func responseAsksForConfirmation(_ responseText: String) -> Bool {
+        let lowercasedResponse = responseText.lowercased()
+        guard lowercasedResponse.contains("?") else { return false }
+        let confirmationCues = [
+            "say yes", "should i", "want me to", "shall i", "do you want me",
+            "confirm", "go ahead", "ok to", "okay to",
+        ]
+        return confirmationCues.contains(where: { lowercasedResponse.contains($0) })
     }
 
     /// If the cursor is in transient mode (user toggled "Show Clicky" off),
