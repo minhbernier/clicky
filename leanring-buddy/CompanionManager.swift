@@ -413,13 +413,21 @@ final class CompanionManager: ObservableObject {
     /// guards in WindowPositionManager fall back to opening System Settings on
     /// later attempts once macOS has shown its one-time prompt.
     private func requestAllNeededPermissionsOnLaunch() {
-        if !hasMicrophonePermission {
+        // Only ever fire the microphone prompt when the user has truly never been
+        // asked — never re-prompt once a decision exists.
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
             promptForMicrophoneIfNotDetermined()
         }
-        if !hasAccessibilityPermission {
+        // Accessibility's AXIsProcessTrusted() is reliable, so a false reading
+        // won't nag — request only when genuinely not trusted.
+        if !WindowPositionManager.hasAccessibilityPermission() {
             WindowPositionManager.requestAccessibilityPermission()
         }
-        if !hasScreenRecordingPermission {
+        // Screen Recording's preflight check frequently returns a false negative
+        // at launch even after the user granted it, which made Micky re-prompt on
+        // every open. Use the tolerant check (honors the last confirmed-granted
+        // state) so we only prompt when it was never actually granted.
+        if !WindowPositionManager.shouldTreatScreenRecordingPermissionAsGrantedForSessionLaunch() {
             WindowPositionManager.requestScreenRecordingPermission()
         }
     }
