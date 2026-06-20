@@ -10,9 +10,26 @@
 import AVFoundation
 import SwiftUI
 
+/// The two top-level tabs in the menu bar panel.
+enum CompanionPanelTab {
+    case home
+    case agents
+}
+
 struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
     @State private var emailInput: String = ""
+    @State private var selectedTab: CompanionPanelTab = .home
+    /// When set, the Agents tab shows the follow-up detail view for this task
+    /// instead of the task list.
+    @State private var openedAgentTaskID: UUID? = nil
+    @State private var agentFollowUpText: String = ""
+
+    /// The tab switcher and Agents tab only make sense once the user is fully
+    /// set up; during onboarding/permissions the panel stays single-purpose.
+    private var shouldShowTabs: Bool {
+        companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -21,6 +38,69 @@ struct CompanionPanelView: View {
                 .background(DS.Colors.borderSubtle)
                 .padding(.horizontal, 16)
 
+            if shouldShowTabs {
+                tabSwitcher
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+            }
+
+            if shouldShowTabs && selectedTab == .agents {
+                agentsTabContent
+            } else {
+                homeTabContent
+            }
+
+            Spacer()
+                .frame(height: 12)
+
+            Divider()
+                .background(DS.Colors.borderSubtle)
+                .padding(.horizontal, 16)
+
+            footerSection
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+        }
+        .frame(width: 320)
+        .background(panelBackground)
+    }
+
+    // MARK: - Tab Switcher
+
+    private var tabSwitcher: some View {
+        HStack(spacing: 4) {
+            tabButton(title: "Home", tab: .home)
+            tabButton(title: "Agents", tab: .agents)
+            Spacer()
+        }
+    }
+
+    private func tabButton(title: String, tab: CompanionPanelTab) -> some View {
+        let isSelected = selectedTab == tab
+        return Button(action: {
+            selectedTab = tab
+            // Always return to the task list when switching back into Agents.
+            if tab == .agents { openedAgentTaskID = nil }
+        }) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                        .fill(isSelected ? Color.white.opacity(0.1) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
+    }
+
+    // MARK: - Home Tab
+
+    @ViewBuilder
+    private var homeTabContent: some View {
+        VStack(alignment: .leading, spacing: 0) {
             permissionsCopySection
                 .padding(.top, 16)
                 .padding(.horizontal, 16)
@@ -30,6 +110,18 @@ struct CompanionPanelView: View {
                     .frame(height: 12)
 
                 modelPickerRow
+                    .padding(.horizontal, 16)
+
+                Spacer()
+                    .frame(height: 6)
+
+                cursorColorPickerRow
+                    .padding(.horizontal, 16)
+
+                Spacer()
+                    .frame(height: 6)
+
+                activeIntegrationsRow
                     .padding(.horizontal, 16)
             }
 
@@ -49,15 +141,6 @@ struct CompanionPanelView: View {
                     .padding(.horizontal, 16)
             }
 
-            // Show Clicky toggle — hidden for now
-            // if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-            //     Spacer()
-            //         .frame(height: 16)
-            //
-            //     showClickyCursorToggleRow
-            //         .padding(.horizontal, 16)
-            // }
-
             if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
                 Spacer()
                     .frame(height: 16)
@@ -65,20 +148,7 @@ struct CompanionPanelView: View {
                 dmFarzaButton
                     .padding(.horizontal, 16)
             }
-
-            Spacer()
-                .frame(height: 12)
-
-            Divider()
-                .background(DS.Colors.borderSubtle)
-                .padding(.horizontal, 16)
-
-            footerSection
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
         }
-        .frame(width: 320)
-        .background(panelBackground)
     }
 
     // MARK: - Header
@@ -641,6 +711,75 @@ struct CompanionPanelView: View {
         .pointerCursor()
     }
 
+    // MARK: - Cursor Color Picker
+
+    private var cursorColorPickerRow: some View {
+        HStack {
+            Text("Cursor color")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(DS.Colors.textSecondary)
+
+            Spacer()
+
+            HStack(spacing: 10) {
+                ForEach(CompanionManager.CursorColorChoice.allCases) { colorChoice in
+                    cursorColorSwatch(colorChoice)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func cursorColorSwatch(_ colorChoice: CompanionManager.CursorColorChoice) -> some View {
+        let isSelected = companionManager.cursorColorChoice == colorChoice
+        return Button(action: {
+            companionManager.setCursorColorChoice(colorChoice)
+        }) {
+            Circle()
+                .fill(colorChoice.color)
+                .frame(width: 16, height: 16)
+                .overlay(
+                    Circle()
+                        .stroke(Color.white.opacity(isSelected ? 0.95 : 0), lineWidth: 2)
+                )
+                .overlay(
+                    Circle()
+                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+                )
+                .shadow(color: colorChoice.color.opacity(isSelected ? 0.6 : 0), radius: 4)
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
+    }
+
+    // MARK: - Active Integrations
+
+    /// Informational row showing the account connectors the power session can use
+    /// (Gmail, Calendar, Drive). These are reachable through Micky's power mode.
+    private var activeIntegrationsRow: some View {
+        HStack {
+            Text("Integrations")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(DS.Colors.textSecondary)
+
+            Spacer()
+
+            HStack(spacing: 12) {
+                integrationIcon(systemName: "envelope.fill", help: "Gmail")
+                integrationIcon(systemName: "calendar", help: "Calendar")
+                integrationIcon(systemName: "folder.fill", help: "Drive")
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func integrationIcon(systemName: String, help: String) -> some View {
+        Image(systemName: systemName)
+            .font(.system(size: 12, weight: .medium))
+            .foregroundColor(DS.Colors.textTertiary)
+            .help(help)
+    }
+
     // MARK: - DM Farza Button
 
     private var dmFarzaButton: some View {
@@ -714,6 +853,176 @@ struct CompanionPanelView: View {
                 .pointerCursor()
             }
         }
+    }
+
+    // MARK: - Agents Tab
+
+    @ViewBuilder
+    private var agentsTabContent: some View {
+        if let openedAgentTaskID,
+           let openedAgentTask = companionManager.agentTaskStore.agentTask(withID: openedAgentTaskID) {
+            agentTaskDetailView(for: openedAgentTask)
+        } else {
+            agentTaskListView
+        }
+    }
+
+    private var agentTaskListView: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if companionManager.agentTaskStore.agentTasks.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 22))
+                        .foregroundColor(DS.Colors.textTertiary)
+                    Text("No agents yet")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(DS.Colors.textSecondary)
+                    Text("Ask Micky to do a multi-step job — like checking your email or editing a file — and it'll show up here.")
+                        .font(.system(size: 11))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 24)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 10) {
+                        ForEach(companionManager.agentTaskStore.agentTasks) { agentTask in
+                            AgentTaskCardView(
+                                agentTask: agentTask,
+                                isSelected: false,
+                                onSelect: {
+                                    companionManager.agentTaskStore.selectedAgentTaskID = agentTask.id
+                                    openedAgentTaskID = agentTask.id
+                                },
+                                onDismiss: {
+                                    companionManager.agentTaskStore.removeAgentTask(withID: agentTask.id)
+                                }
+                            )
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+                }
+                .frame(maxHeight: 320)
+            }
+        }
+    }
+
+    private func agentTaskDetailView(for agentTask: AgentTask) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Detail header: back button, title, status pill.
+            HStack(spacing: 8) {
+                Button(action: { openedAgentTaskID = nil }) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(DS.Colors.textSecondary)
+                        .frame(width: 22, height: 22)
+                        .background(Circle().fill(Color.white.opacity(0.08)))
+                }
+                .buttonStyle(.plain)
+                .pointerCursor()
+
+                Text(agentTask.title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(DS.Colors.textPrimary)
+                    .lineLimit(1)
+
+                Spacer()
+
+                AgentTaskStatusPill(status: agentTask.status)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+
+            // Transcript of the back-and-forth.
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(agentTask.transcript) { message in
+                        agentTranscriptBubble(for: message)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 240)
+
+            // Text + Voice follow-up controls.
+            agentFollowUpControls(for: agentTask)
+                .padding(.horizontal, 16)
+                .padding(.top, 4)
+        }
+    }
+
+    private func agentTranscriptBubble(for message: AgentTaskMessage) -> some View {
+        let isUser = message.role == .user
+        return HStack {
+            if isUser { Spacer(minLength: 32) }
+            Text(message.text)
+                .font(.system(size: 12))
+                .foregroundColor(isUser ? DS.Colors.textPrimary : DS.Colors.textSecondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(
+                    RoundedRectangle(cornerRadius: DS.CornerRadius.large, style: .continuous)
+                        .fill(isUser ? DS.Colors.accent.opacity(0.22) : Color.white.opacity(0.06))
+                )
+                .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
+            if !isUser { Spacer(minLength: 32) }
+        }
+    }
+
+    private func agentFollowUpControls(for agentTask: AgentTask) -> some View {
+        HStack(spacing: 8) {
+            TextField("Follow up by text…", text: $agentFollowUpText)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundColor(DS.Colors.textPrimary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                        .fill(Color.white.opacity(0.08))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+                )
+                .onSubmit { sendAgentFollowUpText(to: agentTask) }
+
+            Button(action: { sendAgentFollowUpText(to: agentTask) }) {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.system(size: 22))
+                    .foregroundColor(isAgentFollowUpSendable ? DS.Colors.accent : DS.Colors.textTertiary.opacity(0.5))
+            }
+            .buttonStyle(.plain)
+            .pointerCursor()
+            .disabled(!isAgentFollowUpSendable)
+
+            // Voice follow-up: toggles a dictation session bound to this task.
+            Button(action: {
+                companionManager.toggleVoiceFollowUp(forAgentTaskID: agentTask.id)
+            }) {
+                Image(systemName: companionManager.isRecordingVoiceFollowUp ? "stop.circle.fill" : "mic.circle.fill")
+                    .font(.system(size: 22))
+                    .foregroundColor(companionManager.isRecordingVoiceFollowUp ? DS.Colors.destructiveText : DS.Colors.textSecondary)
+            }
+            .buttonStyle(.plain)
+            .pointerCursor()
+        }
+    }
+
+    private var isAgentFollowUpSendable: Bool {
+        !agentFollowUpText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func sendAgentFollowUpText(to agentTask: AgentTask) {
+        guard isAgentFollowUpSendable else { return }
+        companionManager.sendFollowUpText(agentFollowUpText, toAgentTaskID: agentTask.id)
+        agentFollowUpText = ""
     }
 
     // MARK: - Visual Helpers

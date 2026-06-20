@@ -135,6 +135,38 @@ final class CompanionManager: ObservableObject {
         claudeAPI.model = model
     }
 
+    /// User-selectable accent color for the blue cursor companion. `.blue` maps
+    /// to the original overlay color so the default look is unchanged. Persisted
+    /// so the choice survives restarts; the overlay reads `cursorColor` directly.
+    enum CursorColorChoice: String, CaseIterable, Identifiable {
+        case blue
+        case red
+        case yellow
+        case green
+
+        var id: String { rawValue }
+
+        var color: Color {
+            switch self {
+            case .blue: return DS.Colors.overlayCursorBlue
+            case .red: return DS.Colors.destructiveText
+            case .yellow: return DS.Colors.warning
+            case .green: return DS.Colors.success
+            }
+        }
+    }
+
+    @Published var cursorColorChoice: CursorColorChoice =
+        CursorColorChoice(rawValue: UserDefaults.standard.string(forKey: "cursorColorChoice") ?? "") ?? .blue
+
+    /// The resolved cursor color the overlay renders with.
+    var cursorColor: Color { cursorColorChoice.color }
+
+    func setCursorColorChoice(_ choice: CursorColorChoice) {
+        cursorColorChoice = choice
+        UserDefaults.standard.set(choice.rawValue, forKey: "cursorColorChoice")
+    }
+
     /// User preference for whether the Clicky cursor should be shown.
     /// When toggled off, the overlay is hidden and push-to-talk is disabled.
     /// Persisted to UserDefaults so the choice survives app restarts.
