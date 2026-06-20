@@ -190,6 +190,17 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    /// Whether the upstream Farza intro video + theme music play during
+    /// onboarding. This fork (Micky) disables them by default so onboarding is
+    /// effectively skipped — the cursor just appears. Set the Info.plist key
+    /// "FarzaOnboardingEnabled" to YES to restore the original experience.
+    var isFarzaOnboardingEnabled: Bool {
+        guard let rawValue = AppBundleConfiguration.stringValue(forKey: "FarzaOnboardingEnabled")?.lowercased() else {
+            return false
+        }
+        return rawValue == "yes" || rawValue == "true" || rawValue == "1"
+    }
+
     /// Whether the user has completed onboarding at least once. Persisted
     /// to UserDefaults so the Start button only appears on first launch.
     var hasCompletedOnboarding: Bool {
@@ -292,6 +303,9 @@ final class CompanionManager: ObservableObject {
     }
 
     private func startOnboardingMusic() {
+        // Disabled for the Micky fork — the upstream theme music only plays when
+        // the Farza onboarding experience is explicitly re-enabled.
+        guard isFarzaOnboardingEnabled else { return }
         stopOnboardingMusic()
         guard let musicURL = Bundle.main.url(forResource: "ff", withExtension: "mp3") else {
             print("⚠️ Clicky: ff.mp3 not found in bundle")
@@ -1033,6 +1047,9 @@ final class CompanionManager: ObservableObject {
     /// Sets up the onboarding video player, starts playback, and schedules
     /// the demo interaction at 40s. Called by BlueCursorView when onboarding starts.
     func setupOnboardingVideo() {
+        // Disabled for the Micky fork — the upstream intro video only plays when
+        // the Farza onboarding experience is explicitly re-enabled.
+        guard isFarzaOnboardingEnabled else { return }
         guard let videoURL = URL(string: "https://stream.mux.com/e5jB8UuSrtFABVnTHCR7k3sIsmcUHCyhtLu1tzqLlfs.m3u8") else { return }
 
         let player = AVPlayer(url: videoURL)

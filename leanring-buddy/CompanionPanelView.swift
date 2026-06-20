@@ -835,7 +835,7 @@ struct CompanionPanelView: View {
             .buttonStyle(.plain)
             .pointerCursor()
 
-            if companionManager.hasCompletedOnboarding {
+            if companionManager.hasCompletedOnboarding && companionManager.isFarzaOnboardingEnabled {
                 Spacer()
 
                 Button(action: {

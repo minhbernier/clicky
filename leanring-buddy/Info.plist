@@ -11,7 +11,7 @@
 	<key>VoiceTranscriptionProvider</key>
 	<string>parakeet</string>
 	<key>VoiceTTSProvider</key>
-	<string>system</string>
+	<string>elevenlabs</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
