@@ -70,14 +70,14 @@ final class CompanionManager: ObservableObject {
     /// the Agents tab. Lives here so task state is shared across all panels.
     let agentTaskStore = AgentTaskStore()
 
-    /// When the user starts a voice follow-up from the Agents tab, this holds
-    /// the task that the next push-to-talk transcript should be attached to.
-    /// Consumed (cleared) once that transcript is sent.
-    private var pendingVoiceFollowUpAgentTaskID: UUID?
-
     /// True while a voice follow-up dictation session (started from a tab button,
     /// not the hardware shortcut) is recording. Drives the Voice button's UI.
     @Published private(set) var isRecordingVoiceFollowUp = false
+
+    /// The agent task whose turn is currently in flight, if any. Used so a turn
+    /// that gets superseded (cancelled) by a newer, unrelated request can settle
+    /// its card out of the spinning .running state instead of stranding it.
+    private var currentInFlightAgentTaskID: UUID?
 
     /// Forwards the agent task store's changes to this manager's observers.
     /// SwiftUI views (the menu bar Agents tab and the right-side task panel)
@@ -557,6 +557,15 @@ final class CompanionManager: ObservableObject {
                     self.voiceState = .processing
                 } else {
                     self.voiceState = .idle
+                    // A button-initiated voice follow-up that ended without
+                    // producing a transcript (empty utterance, denied permission,
+                    // or aborted start) never runs its submit closure, so reset the
+                    // recording flag here so the Voice button doesn't stay stuck on
+                    // its red "stop" state, and fade any transiently-shown overlay.
+                    if self.isRecordingVoiceFollowUp {
+                        self.isRecordingVoiceFollowUp = false
+                        self.scheduleTransientHideIfNeeded()
+                    }
                     // If the user pressed and released the hotkey without
                     // saying anything, no response task runs — schedule the
                     // transient hide here so the overlay doesn't get stuck.
@@ -631,19 +640,23 @@ final class CompanionManager: ObservableObject {
                         self.lastTranscript = finalTranscript
                         print("🗣️ Companion received transcript: \(finalTranscript)")
                         ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
-                        // If this transcript is a voice follow-up to a specific
-                        // task, attach it to that task; otherwise let the send
-                        // path decide whether it's a new agent task.
-                        let followUpAgentTaskID = self.pendingVoiceFollowUpAgentTaskID
-                        self.pendingVoiceFollowUpAgentTaskID = nil
+                        // Hardware push-to-talk is always a fresh request — let the
+                        // send path classify it. (Voice follow-ups to a specific
+                        // task come through toggleVoiceFollowUp's own closure, which
+                        // passes that task id directly.)
                         self.sendTranscriptToClaudeWithScreenshot(
                             transcript: finalTranscript,
-                            associatedAgentTaskID: followUpAgentTaskID
+                            associatedAgentTaskID: nil
                         )
                     }
                 )
             }
         case .released:
+            // A button-initiated voice follow-up uses the same dictation machinery
+            // as the hardware shortcut, so a stray hardware release while a follow-up
+            // is recording would otherwise force-finalize it. Ignore the release in
+            // that case — the follow-up is toggled off from its own button.
+            guard !isRecordingVoiceFollowUp else { return }
             // Cancel the pending start task in case the user released the shortcut
             // before the async startPushToTalk had a chance to begin recording.
             // Without this, a quick press-and-release drops the release event and
@@ -727,6 +740,8 @@ final class CompanionManager: ObservableObject {
             }
             return nil
         }()
+
+        currentInFlightAgentTaskID = effectiveAgentTaskID
 
         currentResponseTask = Task {
             // Stay in processing (spinner) state — no streaming text displayed
@@ -864,7 +879,14 @@ final class CompanionManager: ObservableObject {
                     }
                 }
             } catch is CancellationError {
-                // User spoke again — response was interrupted
+                // User spoke again — this turn was superseded. If it belonged to a
+                // task that is NOT the one now in flight, don't leave that card
+                // spinning forever; settle it back to done (its prior reply stands).
+                if let effectiveAgentTaskID,
+                   effectiveAgentTaskID != currentInFlightAgentTaskID,
+                   agentTaskStore.agentTask(withID: effectiveAgentTaskID)?.status == .running {
+                    agentTaskStore.updateStatus(.done, forTaskWithID: effectiveAgentTaskID)
+                }
             } catch {
                 ClickyAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
@@ -913,7 +935,6 @@ final class CompanionManager: ObservableObject {
         // Don't start if another dictation (e.g. the hardware shortcut) is busy.
         guard !buddyDictationManager.isDictationInProgress else { return }
 
-        pendingVoiceFollowUpAgentTaskID = agentTaskID
         isRecordingVoiceFollowUp = true
 
         // Bring the cursor overlay up transiently so the waveform is visible,
@@ -934,15 +955,22 @@ final class CompanionManager: ObservableObject {
                     guard let self else { return }
                     self.isRecordingVoiceFollowUp = false
                     self.lastTranscript = finalTranscript
-                    let followUpAgentTaskID = self.pendingVoiceFollowUpAgentTaskID
-                    self.pendingVoiceFollowUpAgentTaskID = nil
                     ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
+                    // Attach the follow-up to the task captured at button-tap time.
                     self.sendTranscriptToClaudeWithScreenshot(
                         transcript: finalTranscript,
-                        associatedAgentTaskID: followUpAgentTaskID
+                        associatedAgentTaskID: agentTaskID
                     )
                 }
             )
+
+            // If the session never actually began (permission denied, recognition
+            // error, cancelled, or superseded), the submit closure won't run — roll
+            // back the optimistic flag so the Voice button isn't stuck recording.
+            if !self.buddyDictationManager.isDictationInProgress && self.isRecordingVoiceFollowUp {
+                self.isRecordingVoiceFollowUp = false
+                self.scheduleTransientHideIfNeeded()
+            }
         }
     }
 
@@ -951,13 +979,21 @@ final class CompanionManager: ObservableObject {
     /// model to do exactly this before any mutating action, so a reply that both
     /// asks a question and invites a yes/confirmation is treated as pending.
     static func responseAsksForConfirmation(_ responseText: String) -> Bool {
-        let lowercasedResponse = responseText.lowercased()
-        guard lowercasedResponse.contains("?") else { return false }
+        let trimmedResponse = responseText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // A confirmation prompt ends by asking the user to approve, so it must end
+        // with a question mark and the cue must be near the end — this avoids
+        // mislabeling normal explanatory replies that merely contain a cue word
+        // somewhere (e.g. a "want me to go deeper?" seed-planting closer).
+        guard trimmedResponse.hasSuffix("?") else { return false }
+        let closingFragment = String(trimmedResponse.suffix(90))
+        // The proxy's power gate instructs the model to ask the user to "say yes",
+        // so prioritize that and a few strong, action-oriented confirmation cues.
+        // Deliberately omit broad cues like "want me to", "confirm", and "go ahead"
+        // that fire on ordinary conversational follow-up questions.
         let confirmationCues = [
-            "say yes", "should i", "want me to", "shall i", "do you want me",
-            "confirm", "go ahead", "ok to", "okay to",
+            "say yes", "should i", "shall i", "do you want me to", "ok to ", "okay to ",
         ]
-        return confirmationCues.contains(where: { lowercasedResponse.contains($0) })
+        return confirmationCues.contains(where: { closingFragment.contains($0) })
     }
 
     /// If the cursor is in transient mode (user toggled "Show Clicky" off),

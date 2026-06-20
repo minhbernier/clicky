@@ -118,7 +118,26 @@ enum AgentTaskClassifier {
     /// rather than a quick screen question.
     static func looksLikeAgentTask(_ userMessage: String) -> Bool {
         let lowercasedMessage = userMessage.lowercased()
-        return agentTaskKeywords.contains(where: { lowercasedMessage.contains($0) })
+
+        // Multi-word keywords (e.g. "my mail", "google doc", "make a") are specific
+        // enough to match as plain substrings.
+        let phraseKeywords = agentTaskKeywords
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { $0.contains(" ") }
+        if phraseKeywords.contains(where: { lowercasedMessage.contains($0) }) {
+            return true
+        }
+
+        // Single-word keywords are matched on WORD boundaries, not raw substrings,
+        // so ordinary words that merely contain a keyword ("encoded" → "code",
+        // "eventually" → "event", "address" → "add") don't spuriously create a card.
+        let singleWordKeywords = Set(
+            agentTaskKeywords
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.contains(" ") }
+        )
+        let messageWords = lowercasedMessage.split { !$0.isLetter && !$0.isNumber }.map(String.init)
+        return messageWords.contains(where: { singleWordKeywords.contains($0) })
     }
 
     /// Builds a short, title-cased label (max ~6 words) from the user's request

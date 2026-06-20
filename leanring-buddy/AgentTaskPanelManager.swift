@@ -109,6 +109,11 @@ final class AgentTaskPanelManager: NSObject {
             createPanel()
         }
         positionPanelOnRightEdge()
+        // Make the panel key so the "follow up with agent…" TextField can receive
+        // keystrokes. Because it's a .nonactivatingPanel, becoming key does not
+        // activate the app or steal the user's app focus — it only routes the field
+        // editor — mirroring MenuBarPanelManager.
+        panel?.makeKeyAndOrderFront(nil)
         panel?.orderFrontRegardless()
     }
 
