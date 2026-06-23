@@ -1025,6 +1025,7 @@ final class CompanionManager: ObservableObject {
         // that fire on ordinary conversational follow-up questions.
         let confirmationCues = [
             "say yes", "should i", "shall i", "do you want me to", "ok to ", "okay to ",
+            "can i ", "may i ",
         ]
         return confirmationCues.contains(where: { closingFragment.contains($0) })
     }
