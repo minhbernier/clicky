@@ -726,6 +726,7 @@ final class CompanionManager: ObservableObject {
         //  - otherwise a request that reads like a multi-step/power job spawns a
         //    new task card,
         //  - plain screen questions get no card.
+        var didCreateNewAgentTask = false
         let effectiveAgentTaskID: UUID? = {
             if let associatedAgentTaskID {
                 agentTaskStore.appendUserMessage(transcript, toTaskWithID: associatedAgentTaskID)
@@ -733,6 +734,7 @@ final class CompanionManager: ObservableObject {
                 return associatedAgentTaskID
             }
             if AgentTaskClassifier.looksLikeAgentTask(transcript) {
+                didCreateNewAgentTask = true
                 return agentTaskStore.createAgentTask(
                     title: AgentTaskClassifier.makeTitle(from: transcript),
                     initialUserMessage: transcript
@@ -742,6 +744,25 @@ final class CompanionManager: ObservableObject {
         }()
 
         currentInFlightAgentTaskID = effectiveAgentTaskID
+
+        // Per-agent routing metadata: agent turns go to their OWN isolated proxy
+        // session (own memory), keyed by the task id, focused on the original task.
+        let agentRoutingID = effectiveAgentTaskID?.uuidString
+        let agentRoutingTask = effectiveAgentTaskID.flatMap { agentTaskStore.agentTask(withID: $0) }
+        let agentRoutingName = agentRoutingTask?.title
+        let agentRoutingOriginalTask = agentRoutingTask?.transcript.first(where: { $0.role == .user })?.text ?? transcript
+
+        // For a brand-new agent, generate a contextual gerund name asynchronously.
+        // The instant placeholder (makeTitle) shows immediately, then upgrades when
+        // the model label returns — never blocks the turn.
+        if didCreateNewAgentTask, let newAgentTaskID = effectiveAgentTaskID {
+            Task { [weak self] in
+                guard let self else { return }
+                if let generatedTitle = await self.claudeAPI.generateAgentTitle(text: transcript) {
+                    self.agentTaskStore.setTitle(generatedTitle, forTaskWithID: newAgentTaskID)
+                }
+            }
+        }
 
         currentResponseTask = Task {
             // Stay in processing (spinner) state — no streaming text displayed
@@ -761,16 +782,24 @@ final class CompanionManager: ObservableObject {
                     return (data: capture.imageData, label: capture.label + dimensionInfo)
                 }
 
-                // Pass conversation history so Claude remembers prior exchanges
-                let historyForAPI = conversationHistory.map { entry in
-                    (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
-                }
+                // Agent turns use the proxy's per-agent isolated session (its own
+                // memory), so we send the agent id + focused metadata and NO global
+                // history. The main chat keeps the shared conversationHistory.
+                let isAgentTurn = agentRoutingID != nil
+                let historyForAPI: [(userPlaceholder: String, assistantResponse: String)] = isAgentTurn
+                    ? []
+                    : conversationHistory.map { entry in
+                        (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
+                    }
 
                 let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
                     images: labeledImages,
                     systemPrompt: Self.companionVoiceResponseSystemPrompt,
                     conversationHistory: historyForAPI,
                     userPrompt: transcript,
+                    agentID: agentRoutingID,
+                    agentName: agentRoutingName,
+                    agentTask: agentRoutingOriginalTask,
                     onTextChunk: { _ in
                         // No streaming text display — spinner stays until TTS plays
                     }
@@ -837,19 +866,23 @@ final class CompanionManager: ObservableObject {
                     print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
                 }
 
-                // Save this exchange to conversation history (with the point tag
-                // stripped so it doesn't confuse future context)
-                conversationHistory.append((
-                    userTranscript: transcript,
-                    assistantResponse: spokenText
-                ))
+                // Save this exchange to the MAIN chat's conversation history. Agent
+                // turns are excluded — their context lives in the proxy's per-agent
+                // session and the task transcript — so agents and the main chat
+                // don't bleed into each other.
+                if !isAgentTurn {
+                    conversationHistory.append((
+                        userTranscript: transcript,
+                        assistantResponse: spokenText
+                    ))
 
-                // Keep only the last 10 exchanges to avoid unbounded context growth
-                if conversationHistory.count > 10 {
-                    conversationHistory.removeFirst(conversationHistory.count - 10)
+                    // Keep only the last 10 exchanges to avoid unbounded context growth
+                    if conversationHistory.count > 10 {
+                        conversationHistory.removeFirst(conversationHistory.count - 10)
+                    }
+
+                    print("🧠 Conversation history: \(conversationHistory.count) exchanges")
                 }
-
-                print("🧠 Conversation history: \(conversationHistory.count) exchanges")
 
                 ClickyAnalytics.trackAIResponseReceived(response: spokenText)
 

@@ -68,6 +68,16 @@ final class AgentTaskStore: ObservableObject {
         }
     }
 
+    /// Replaces a task's title — used when the model-generated label arrives
+    /// asynchronously and upgrades the instant placeholder name.
+    func setTitle(_ title: String, forTaskWithID agentTaskID: UUID) {
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty else { return }
+        mutateAgentTask(withID: agentTaskID) { agentTask in
+            agentTask.title = trimmedTitle
+        }
+    }
+
     func agentTask(withID agentTaskID: UUID) -> AgentTask? {
         agentTasks.first(where: { $0.id == agentTaskID })
     }
@@ -99,43 +109,37 @@ final class AgentTaskStore: ObservableObject {
 /// proxy would route to its power session — plain "what is this?" screen
 /// questions stay card-free.
 enum AgentTaskClassifier {
-    /// Keyword set mirrored from clicky-max-proxy/proxy.py POWER_KEYWORDS. Kept
-    /// in sync manually; if the proxy's list changes, update this too.
-    private static let agentTaskKeywords: [String] = [
-        // connectors
-        "email", "emails", "inbox", "gmail", "unread", "my mail", "calendar",
-        "schedule", "meeting", "meetings", "appointment", "agenda", "event",
-        "events", "free time", "availability", "my day", "drive", "my files",
-        "google doc", "spreadsheet",
-        // actions / editing / agents
+    /// ACTION / verb keywords. A request only becomes its own tracked agent when
+    /// it asks Micky to DO something (edit, draft, research, launch, …) — not when
+    /// it merely looks something up. This keeps quick connector/screen questions
+    /// ("what's on my calendar?", "what does this code do?") card-free, while
+    /// "draft a reply to this email" or "research the clicky diffs" spawn an agent.
+    /// Mirrors the proxy's action + agent/research keyword groups (manually synced).
+    private static let actionKeywords: [String] = [
+        // edits / actions
         "edit", "change", "fix", "update", "write", "create", "delete", "remove",
-        "rename", "refactor", "commit", "install", "build", "run ", "open ",
-        "launch", "agent", "agents", "send", "reply", "draft", "make a", "add ",
-        "file", "folder", "script", "code", "terminal", "command", "do this",
+        "rename", "refactor", "commit", "install", "build", "run", "open",
+        "send", "reply", "draft", "add", "schedule", "make a", "do this",
+        // agent / research launches
+        "agent", "agents", "research", "investigate", "deep dive", "deep-dive",
+        "look into", "dig into", "sub-agent", "subagent", "launch",
     ]
 
-    /// Returns true when the request reads like a multi-step / power-session job
-    /// rather than a quick screen question.
+    /// Returns true when the request asks Micky to DO a task (worth tracking as
+    /// its own agent), rather than a quick lookup or screen question.
     static func looksLikeAgentTask(_ userMessage: String) -> Bool {
-        let lowercasedMessage = userMessage.lowercased()
+        textMatchesAnyKeyword(userMessage.lowercased(), actionKeywords)
+    }
 
-        // Multi-word keywords (e.g. "my mail", "google doc", "make a") are specific
-        // enough to match as plain substrings.
-        let phraseKeywords = agentTaskKeywords
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { $0.contains(" ") }
+    /// Keyword match: word boundaries for single words (so "run" doesn't fire
+    /// inside "running"), substring for multi-word / hyphenated phrases.
+    private static func textMatchesAnyKeyword(_ lowercasedMessage: String, _ keywords: [String]) -> Bool {
+        let trimmedKeywords = keywords.map { $0.trimmingCharacters(in: .whitespaces) }
+        let phraseKeywords = trimmedKeywords.filter { $0.contains(" ") || $0.contains("-") }
         if phraseKeywords.contains(where: { lowercasedMessage.contains($0) }) {
             return true
         }
-
-        // Single-word keywords are matched on WORD boundaries, not raw substrings,
-        // so ordinary words that merely contain a keyword ("encoded" → "code",
-        // "eventually" → "event", "address" → "add") don't spuriously create a card.
-        let singleWordKeywords = Set(
-            agentTaskKeywords
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.contains(" ") }
-        )
+        let singleWordKeywords = Set(trimmedKeywords.filter { !$0.contains(" ") && !$0.contains("-") })
         let messageWords = lowercasedMessage.split { !$0.isLetter && !$0.isNumber }.map(String.init)
         return messageWords.contains(where: { singleWordKeywords.contains($0) })
     }

@@ -927,18 +927,27 @@ struct CompanionPanelView: View {
             .padding(.horizontal, 16)
             .padding(.top, 12)
 
-            // Transcript of the back-and-forth.
-            ScrollView {
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(agentTask.transcript) { message in
-                        agentTranscriptBubble(for: message)
+            // Transcript of the back-and-forth — auto-scrolls to the newest message.
+            ScrollViewReader { scrollProxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(agentTask.transcript) { message in
+                            agentTranscriptBubble(for: message)
+                                .id(message.id)
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 240)
+                .onChange(of: agentTask.transcript.count) { _ in
+                    guard let lastMessageID = agentTask.transcript.last?.id else { return }
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        scrollProxy.scrollTo(lastMessageID, anchor: .bottom)
                     }
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxHeight: 240)
 
             // Text + Voice follow-up controls.
             agentFollowUpControls(for: agentTask)

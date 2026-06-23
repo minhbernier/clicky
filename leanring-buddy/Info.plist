@@ -26,7 +26,7 @@
 	<key>SUPublicEDKey</key>
 	<string>/l3d2rw5ZZFRU3AadP/w2Zf8FHfhA6bKv16BQOV5OSk=</string>
 	<key>VoiceTTSProvider</key>
-	<string>openai</string>
+	<string>elevenlabs</string>
 	<key>VoiceTranscriptionProvider</key>
 	<string>parakeet</string>
 </dict>

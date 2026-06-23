@@ -11,11 +11,21 @@ class ClaudeAPI {
     private static var hasStartedTLSWarmup = false
 
     private let apiURL: URL
+    private let titleURL: URL?
     var model: String
     private let session: URLSession
 
     init(proxyURL: String, model: String = "claude-sonnet-4-6") {
         self.apiURL = URL(string: proxyURL)!
+        // Derive the /title endpoint (agent-name generation) from the proxy URL.
+        // A proxy without /title (e.g. the Cloudflare Worker) just yields nil titles.
+        if var titleURLComponents = URLComponents(string: proxyURL) {
+            titleURLComponents.path = "/title"
+            titleURLComponents.query = nil
+            self.titleURL = titleURLComponents.url
+        } else {
+            self.titleURL = nil
+        }
         self.model = model
 
         // Use .default instead of .ephemeral so TLS session tickets are cached.
@@ -103,6 +113,9 @@ class ClaudeAPI {
         systemPrompt: String,
         conversationHistory: [(userPlaceholder: String, assistantResponse: String)] = [],
         userPrompt: String,
+        agentID: String? = nil,
+        agentName: String? = nil,
+        agentTask: String? = nil,
         onTextChunk: @MainActor @Sendable (String) -> Void
     ) async throws -> (text: String, duration: TimeInterval) {
         let startTime = Date()
@@ -139,13 +152,20 @@ class ClaudeAPI {
         ])
         messages.append(["role": "user", "content": contentBlocks])
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": model,
             "max_tokens": 1024,
             "stream": true,
             "system": systemPrompt,
             "messages": messages
         ]
+        // When this turn belongs to an agent, route it to that agent's isolated
+        // proxy session (only added for agent turns — main chat stays unchanged).
+        if let agentID {
+            body["agent_id"] = agentID
+            if let agentName { body["agent_name"] = agentName }
+            if let agentTask { body["agent_task"] = agentTask }
+        }
 
         let bodyData = try JSONSerialization.data(withJSONObject: body)
         request.httpBody = bodyData
@@ -287,5 +307,28 @@ class ClaudeAPI {
 
         let duration = Date().timeIntervalSince(startTime)
         return (text: text, duration: duration)
+    }
+
+    /// Asks the proxy's /title endpoint for a short gerund label for an agent task
+    /// (e.g. "Researching Clicky Diffs"). Returns nil on any failure — a proxy
+    /// without /title, a network error, or an empty title — so the caller keeps
+    /// its instant placeholder name.
+    func generateAgentTitle(text: String) async -> String? {
+        guard let titleURL else { return nil }
+        var request = URLRequest(url: titleURL)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 30
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["text": text])
+
+        guard let (data, response) = try? await session.data(for: request),
+              let httpResponse = response as? HTTPURLResponse,
+              (200...299).contains(httpResponse.statusCode),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let title = json["title"] as? String else {
+            return nil
+        }
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedTitle.isEmpty ? nil : trimmedTitle
     }
 }

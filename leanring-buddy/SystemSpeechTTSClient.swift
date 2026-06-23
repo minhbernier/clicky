@@ -44,6 +44,9 @@ final class SystemSpeechTTSClient: NSObject, BuddyTextToSpeechClient {
         if let preferredVoice = Self.preferredEnglishVoice() {
             speechUtterance.voice = preferredVoice
         }
+        // The system default speech rate is noticeably slow; speak a bit faster.
+        // Override via the SystemTTSSpeechRate Info.plist key (0.0–1.0).
+        speechUtterance.rate = Self.preferredSpeechRate
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             pendingPlaybackStartContinuation = continuation
@@ -73,6 +76,17 @@ final class SystemSpeechTTSClient: NSObject, BuddyTextToSpeechClient {
         guard let continuation = pendingPlaybackStartContinuation else { return }
         pendingPlaybackStartContinuation = nil
         continuation.resume()
+    }
+
+    /// How fast the on-device voice speaks (0.0–1.0). Defaults to ~12% above the
+    /// system default, which is otherwise quite slow. Override with the
+    /// SystemTTSSpeechRate Info.plist key.
+    private static var preferredSpeechRate: Float {
+        if let rawValue = AppBundleConfiguration.stringValue(forKey: "SystemTTSSpeechRate"),
+           let parsedValue = Float(rawValue) {
+            return min(1.0, max(0.0, parsedValue))
+        }
+        return AVSpeechUtteranceDefaultSpeechRate * 1.12
     }
 
     private static func preferredEnglishVoice() -> AVSpeechSynthesisVoice? {
