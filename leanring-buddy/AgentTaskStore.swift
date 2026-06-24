@@ -109,26 +109,34 @@ final class AgentTaskStore: ObservableObject {
 /// proxy would route to its power session — plain "what is this?" screen
 /// questions stay card-free.
 enum AgentTaskClassifier {
-    /// ACTION / verb keywords. A request only becomes its own tracked agent when
-    /// it asks Micky to DO something (edit, draft, research, launch, …) — not when
-    /// it merely looks something up. This keeps quick connector/screen questions
-    /// ("what's on my calendar?", "what does this code do?") card-free, while
-    /// "draft a reply to this email" or "research the clicky diffs" spawn an agent.
-    /// Mirrors the proxy's action + agent/research keyword groups (manually synced).
-    private static let actionKeywords: [String] = [
-        // edits / actions
-        "edit", "change", "fix", "update", "write", "create", "delete", "remove",
-        "rename", "refactor", "commit", "install", "build", "run", "open",
-        "send", "reply", "draft", "add", "schedule", "make a", "do this",
-        // agent / research launches
+    /// Keywords that mark a request as worth tracking as its own AGENT — one that
+    /// needs Micky's real tools/accounts (email, calendar, Drive, the user's
+    /// vault) or is an explicit research/agent launch. Everything else — plain
+    /// screen questions AND casual action phrasing like "how do I run this?",
+    /// "what does this code do?", or "fix this" — deliberately does NOT spawn an
+    /// agent; it gets a quick spoken answer instead. Reserving agents this way
+    /// keeps ordinary questions from each launching a (slow, tracked) agent.
+    /// Mirrors the proxy's POWER_KEYWORDS (connectors + agent/research + vault),
+    /// kept in sync manually.
+    private static let agentWorthyKeywords: [String] = [
+        // connectors / accounts — these genuinely need Micky's Mac + account tools
+        "email", "emails", "inbox", "gmail", "unread", "my mail", "calendar",
+        "schedule", "meeting", "meetings", "appointment", "agenda", "event",
+        "events", "free time", "availability", "my day", "drive", "my files",
+        "google doc", "spreadsheet",
+        // explicit agent / research launches
         "agent", "agents", "research", "investigate", "deep dive", "deep-dive",
         "look into", "dig into", "sub-agent", "subagent", "launch",
+        // personal notes / vault / memory
+        "obsidian", "vault", "jarvis", "my notes", "my note",
     ]
 
-    /// Returns true when the request asks Micky to DO a task (worth tracking as
-    /// its own agent), rather than a quick lookup or screen question.
+    /// Returns true only when the request needs Micky's tools/accounts or is an
+    /// explicit research/agent launch — i.e. genuinely worth tracking as an agent.
+    /// Casual questions and bare action verbs ("run", "open", "fix") stay
+    /// card-free so they don't each spin up an agent.
     static func looksLikeAgentTask(_ userMessage: String) -> Bool {
-        textMatchesAnyKeyword(userMessage.lowercased(), actionKeywords)
+        textMatchesAnyKeyword(userMessage.lowercased(), agentWorthyKeywords)
     }
 
     /// Keyword match: word boundaries for single words (so "run" doesn't fire
