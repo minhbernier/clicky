@@ -79,6 +79,33 @@ final class CompanionManager: ObservableObject {
     /// its card out of the spinning .running state instead of stranding it.
     private var currentInFlightAgentTaskID: UUID?
 
+    /// A typed follow-up the user sent while a turn was still in flight. Text
+    /// follow-ups queue behind the current turn — the agent finishes what it's
+    /// saying first — instead of cutting it off. (Voice interrupts; text waits.)
+    private struct QueuedFollowUpMessage {
+        let text: String
+        let agentTaskID: UUID?
+        /// True when the user's message was already shown in its task transcript
+        /// at enqueue time, so the send path doesn't record it a second time.
+        let isAlreadyRecordedInTranscript: Bool
+    }
+
+    /// Typed follow-ups waiting their turn, oldest first. Drained one at a time
+    /// whenever the response pipeline goes idle.
+    private var queuedFollowUpMessages: [QueuedFollowUpMessage] = []
+
+    /// True while the response pipeline is actively working — recording or
+    /// processing a voice request, generating a reply, or speaking one aloud.
+    /// Typed follow-ups queue behind this instead of interrupting it. A cancelled
+    /// (superseded) response task does not count as busy, so a barge-in that
+    /// cancels without starting a new turn can't strand the queue.
+    private var isResponsePipelineBusy: Bool {
+        if let currentResponseTask, !currentResponseTask.isCancelled {
+            return true
+        }
+        return isRecordingVoiceFollowUp || voiceState != .idle || textToSpeechClient.isPlaying
+    }
+
     /// Forwards the agent task store's changes to this manager's observers.
     /// SwiftUI views (the menu bar Agents tab and the right-side task panel)
     /// observe CompanionManager, but the tasks live in the nested
@@ -575,6 +602,11 @@ final class CompanionManager: ObservableObject {
                     if self.currentResponseTask == nil {
                         self.scheduleTransientHideIfNeeded()
                     }
+                    // If a typed follow-up was queued while voice was recording
+                    // but that recording produced no turn (empty utterance), the
+                    // pipeline is idle now — drain the queue so the message isn't
+                    // stranded. No-ops while anything is still in flight.
+                    self.processNextQueuedFollowUpIfPipelineIdle()
                 }
             }
     }
@@ -609,9 +641,10 @@ final class CompanionManager: ObservableObject {
             // Dismiss the menu bar panel so it doesn't cover the screen
             NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
 
-            // Cancel any in-progress response and TTS from a previous utterance
-            currentResponseTask?.cancel()
-            textToSpeechClient.stopPlayback()
+            // Cancel any in-progress response and TTS from a previous utterance,
+            // resetting supervisory state so the cancelled turn can't wedge the
+            // pipeline at .responding.
+            cancelInFlightResponseForBargeIn()
             clearDetectedElementLocation()
 
             // Dismiss the onboarding prompt if it's showing
@@ -709,6 +742,21 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - AI Response Pipeline
 
+    /// Cancels the in-flight response turn so a voice request can barge in, and
+    /// resets the supervisory state the cancelled turn can no longer reset on its
+    /// own. A cancelled turn skips its settle block, so without this the pipeline
+    /// would stay stuck at `.responding` (or `.processing`) — which makes
+    /// `bindVoiceStateObservation`'s `.responding` guard drop every later state
+    /// update and can strand a queued typed follow-up. Queued follow-ups are left
+    /// intact so they run after the new turn settles.
+    private func cancelInFlightResponseForBargeIn() {
+        currentResponseTask?.cancel()
+        currentResponseTask = nil
+        currentInFlightAgentTaskID = nil
+        textToSpeechClient.stopPlayback()
+        voiceState = .idle
+    }
+
     /// Captures a screenshot, sends it along with the transcript to Claude,
     /// and plays the response aloud via the active TTS client. The cursor stays
     /// in the spinner/processing state until TTS audio begins playing.
@@ -716,8 +764,12 @@ final class CompanionManager: ObservableObject {
     /// the buddy to fly to that element on screen.
     private func sendTranscriptToClaudeWithScreenshot(
         transcript: String,
-        associatedAgentTaskID: UUID? = nil
+        associatedAgentTaskID: UUID? = nil,
+        isAlreadyRecordedInTranscript: Bool = false
     ) {
+        // Supersede any in-flight turn. No supervisory reset is needed here —
+        // this method's own task sets voiceState = .processing immediately below,
+        // so it can't leave the pipeline wedged the way a record-first barge-in can.
         currentResponseTask?.cancel()
         textToSpeechClient.stopPlayback()
 
@@ -729,7 +781,11 @@ final class CompanionManager: ObservableObject {
         var didCreateNewAgentTask = false
         let effectiveAgentTaskID: UUID? = {
             if let associatedAgentTaskID {
-                agentTaskStore.appendUserMessage(transcript, toTaskWithID: associatedAgentTaskID)
+                // A queued follow-up was already shown in the transcript when the
+                // user sent it, so don't record it a second time here.
+                if !isAlreadyRecordedInTranscript {
+                    agentTaskStore.appendUserMessage(transcript, toTaskWithID: associatedAgentTaskID)
+                }
                 agentTaskStore.updateStatus(.running, forTaskWithID: associatedAgentTaskID)
                 return associatedAgentTaskID
             }
@@ -911,6 +967,15 @@ final class CompanionManager: ObservableObject {
                         speakCreditsErrorFallback()
                     }
                 }
+
+                // Keep this turn marked in-flight until the spoken reply finishes
+                // playing, so a typed follow-up the user queued waits for the agent
+                // to stop talking before it runs. A voice interrupt cancels this
+                // task (and stops playback), which breaks out of this wait so the
+                // new request can barge in immediately.
+                while textToSpeechClient.isPlaying && !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 150_000_000)
+                }
             } catch is CancellationError {
                 // User spoke again — this turn was superseded. If it belonged to a
                 // task that is NOT the one now in flight, don't leave that card
@@ -929,9 +994,16 @@ final class CompanionManager: ObservableObject {
                 speakCreditsErrorFallback()
             }
 
+            // The turn has settled. Reaching here un-cancelled means it ran to
+            // completion and still owns the pipeline — a voice barge-in would have
+            // cancelled it — so clear the in-flight markers and start the next
+            // queued typed follow-up, if any.
             if !Task.isCancelled {
                 voiceState = .idle
+                currentResponseTask = nil
+                currentInFlightAgentTaskID = nil
                 scheduleTransientHideIfNeeded()
+                processNextQueuedFollowUpIfPipelineIdle()
             }
         }
     }
@@ -947,9 +1019,49 @@ final class CompanionManager: ObservableObject {
         guard !trimmedText.isEmpty else { return }
         lastTranscript = trimmedText
         ClickyAnalytics.trackUserMessageSent(transcript: trimmedText)
+
+        // If the agent is still answering — generating a reply or speaking one
+        // aloud — don't cut it off. Queue this typed message behind the current
+        // turn; it runs automatically when the pipeline goes idle. (Voice
+        // interrupts; text waits its turn.)
+        if isResponsePipelineBusy {
+            // Show the queued message on its task transcript right away so the
+            // user sees it was received (the input field clears on send), and
+            // mark it already-recorded so the send path won't duplicate it.
+            var isAlreadyRecordedInTranscript = false
+            if let agentTaskID {
+                agentTaskStore.appendUserMessage(trimmedText, toTaskWithID: agentTaskID)
+                isAlreadyRecordedInTranscript = true
+            }
+            queuedFollowUpMessages.append(
+                QueuedFollowUpMessage(
+                    text: trimmedText,
+                    agentTaskID: agentTaskID,
+                    isAlreadyRecordedInTranscript: isAlreadyRecordedInTranscript
+                )
+            )
+            return
+        }
+
         sendTranscriptToClaudeWithScreenshot(
             transcript: trimmedText,
             associatedAgentTaskID: agentTaskID
+        )
+    }
+
+    /// Starts the next queued typed follow-up, but only when the response
+    /// pipeline is fully idle — no turn in flight, nothing recording, no audio
+    /// still playing. If anything is still active, the message stays queued and
+    /// whatever is running will drain it when it settles. Safe to call from any
+    /// settle point; it no-ops when the queue is empty or the pipeline is busy.
+    private func processNextQueuedFollowUpIfPipelineIdle() {
+        guard !isResponsePipelineBusy else { return }
+        guard !queuedFollowUpMessages.isEmpty else { return }
+        let nextQueuedFollowUpMessage = queuedFollowUpMessages.removeFirst()
+        sendTranscriptToClaudeWithScreenshot(
+            transcript: nextQueuedFollowUpMessage.text,
+            associatedAgentTaskID: nextQueuedFollowUpMessage.agentTaskID,
+            isAlreadyRecordedInTranscript: nextQueuedFollowUpMessage.isAlreadyRecordedInTranscript
         )
     }
 
@@ -967,6 +1079,14 @@ final class CompanionManager: ObservableObject {
 
         // Don't start if another dictation (e.g. the hardware shortcut) is busy.
         guard !buddyDictationManager.isDictationInProgress else { return }
+
+        // Barge-in: interrupting with voice cancels whatever the agent is
+        // currently saying or generating, and resets supervisory state so the
+        // cancelled turn can't wedge the pipeline at .responding. This spoken
+        // request takes over right away; any typed follow-ups the user queued stay
+        // queued and run after this voice turn. (Mirrors the hardware push-to-talk
+        // path, which also interrupts on press.)
+        cancelInFlightResponseForBargeIn()
 
         isRecordingVoiceFollowUp = true
 
@@ -1003,6 +1123,9 @@ final class CompanionManager: ObservableObject {
             if !self.buddyDictationManager.isDictationInProgress && self.isRecordingVoiceFollowUp {
                 self.isRecordingVoiceFollowUp = false
                 self.scheduleTransientHideIfNeeded()
+                // The voice follow-up never produced a turn, so the pipeline may
+                // be idle now — drain any typed follow-up queued behind it.
+                self.processNextQueuedFollowUpIfPipelineIdle()
             }
         }
     }
