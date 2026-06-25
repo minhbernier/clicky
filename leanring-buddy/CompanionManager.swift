@@ -133,6 +133,21 @@ final class CompanionManager: ObservableObject {
         return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
     }()
 
+    /// Talks to the proxy's connector routes to recommend and connect apps (via
+    /// Composio). Surfaces the "Connect Discord to Micky" style popup.
+    private lazy var connectorRecommendationService: ConnectorRecommendationService = {
+        return ConnectorRecommendationService(proxyBaseURL: Self.workerBaseURL)
+    }()
+
+    /// The connector recommendation to surface right now, if any.
+    /// ConnectorRecommendationManager observes this to show/hide the popup.
+    @Published private(set) var pendingConnectorRecommendation: ConnectorRecommendation?
+
+    /// Toolkits already shown this app session ("Not now" or already surfaced) so
+    /// we don't re-pop the same card on every later utterance. A permanent "No"
+    /// is recorded server-side; this set is just the in-app nag-suppression.
+    private var connectorSlugsAlreadySurfacedThisSession: Set<String> = []
+
     /// The active text-to-speech client. Defaults to ElevenLabs (cloud); can be
     /// switched to on-device system speech via the `VoiceTTSProvider` Info.plist key.
     private lazy var textToSpeechClient: any BuddyTextToSpeechClient = {
@@ -757,6 +772,50 @@ final class CompanionManager: ObservableObject {
         voiceState = .idle
     }
 
+    // MARK: - Connector recommendations
+
+    /// Ask the proxy whether this utterance should trigger a "Connect … to Micky"
+    /// popup, and if so publish it (the panel manager observes
+    /// pendingConnectorRecommendation). Fire-and-forget: any failure is silent so
+    /// the voice pipeline is never affected. Each app is surfaced at most once per
+    /// app session to avoid nagging.
+    private func maybeRecommendConnector(forUtterance utterance: String) {
+        Task { [weak self] in
+            guard let self else { return }
+            guard let recommendation = await self.connectorRecommendationService.recommendation(forUtterance: utterance) else { return }
+            if self.connectorSlugsAlreadySurfacedThisSession.contains(recommendation.slug) { return }
+            // Don't replace a popup the user hasn't answered yet.
+            if self.pendingConnectorRecommendation != nil { return }
+            self.connectorSlugsAlreadySurfacedThisSession.insert(recommendation.slug)
+            self.pendingConnectorRecommendation = recommendation
+        }
+    }
+
+    /// "Yes" — start the OAuth flow and open Composio's connect link in the
+    /// browser. Dismisses the popup immediately for responsiveness.
+    func acceptConnectorRecommendation(_ recommendation: ConnectorRecommendation) {
+        pendingConnectorRecommendation = nil
+        Task { [weak self] in
+            guard let self else { return }
+            if let connectionURL = await self.connectorRecommendationService.connectionURL(forToolkitSlug: recommendation.slug) {
+                NSWorkspace.shared.open(connectionURL)
+            }
+        }
+    }
+
+    /// "Not now" — just dismiss. It may resurface in a future app session.
+    func snoozeConnectorRecommendation(_ recommendation: ConnectorRecommendation) {
+        pendingConnectorRecommendation = nil
+    }
+
+    /// "No" — dismiss and tell the proxy to stop recommending this app.
+    func declineConnectorRecommendation(_ recommendation: ConnectorRecommendation) {
+        pendingConnectorRecommendation = nil
+        Task { [weak self] in
+            await self?.connectorRecommendationService.suppressRecommendations(forToolkitSlug: recommendation.slug)
+        }
+    }
+
     /// Captures a screenshot, sends it along with the transcript to Claude,
     /// and plays the response aloud via the active TTS client. The cursor stays
     /// in the spinner/processing state until TTS audio begins playing.
@@ -772,6 +831,11 @@ final class CompanionManager: ObservableObject {
         // so it can't leave the pipeline wedged the way a record-first barge-in can.
         currentResponseTask?.cancel()
         textToSpeechClient.stopPlayback()
+
+        // Non-blocking: if this utterance mentions an app the user hasn't connected
+        // yet, surface the "Connect … to Micky" popup. Runs alongside the response
+        // and never affects the voice pipeline.
+        maybeRecommendConnector(forUtterance: transcript)
 
         // Resolve which agent task (if any) this turn belongs to:
         //  - an explicit follow-up target wins,

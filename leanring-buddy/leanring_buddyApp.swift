@@ -31,6 +31,7 @@ struct leanring_buddyApp: App {
 final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
     private var menuBarPanelManager: MenuBarPanelManager?
     private var agentTaskPanelManager: AgentTaskPanelManager?
+    private var connectorRecommendationManager: ConnectorRecommendationManager?
     private let companionManager = CompanionManager()
     private var sparkleUpdaterController: SPUStandardUpdaterController?
 
@@ -47,6 +48,10 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
         // The right-side task panel observes the agent task store and shows/hides
         // itself as tasks come and go, so it just needs to be created and retained.
         agentTaskPanelManager = AgentTaskPanelManager(companionManager: companionManager)
+        // The connector-recommendation popup observes the companion manager's
+        // pendingConnectorRecommendation and presents itself, so it just needs
+        // to be created and retained.
+        connectorRecommendationManager = ConnectorRecommendationManager(companionManager: companionManager)
         companionManager.start()
         // Auto-open the panel if the user still needs to do something:
         // either they haven't onboarded yet, or permissions were revoked.
