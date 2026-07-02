@@ -587,9 +587,15 @@ final class CompanionManager: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] isRecording, isFinalizing, isPreparing in
                 guard let self else { return }
-                // Don't override .responding — the AI response pipeline
-                // manages that state directly until streaming finishes.
-                guard self.voiceState != .responding else { return }
+                // Don't override .responding or .processing while the AI
+                // response pipeline is running — it manages those states
+                // directly until TTS finishes. Gating on currentResponseTask
+                // (not just voiceState) means a barge-in or stuck state can't
+                // wedge the pipeline by silently dropping every later update.
+                if self.currentResponseTask != nil
+                    && (self.voiceState == .responding || self.voiceState == .processing) {
+                    return
+                }
 
                 if isFinalizing {
                     self.voiceState = .processing

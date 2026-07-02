@@ -804,7 +804,11 @@ class OverlayWindowManager {
             )
 
             let hostingView = NSHostingView(rootView: contentView)
-            hostingView.frame = screen.frame
+            // Use window-local coordinates (origin .zero), not global screen coordinates.
+            // The window is already positioned at screen.frame.origin via OverlayWindow.init.
+            // Using screen.frame here (non-zero origin on secondary monitors) would offset
+            // the hosting view outside the window bounds, making the overlay invisible.
+            hostingView.frame = CGRect(origin: .zero, size: screen.frame.size)
             window.contentView = hostingView
 
             overlayWindows.append(window)

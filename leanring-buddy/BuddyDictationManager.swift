@@ -628,6 +628,10 @@ final class BuddyDictationManager: NSObject, ObservableObject {
 
     private func resetSessionState() {
         pendingStartRequestIdentifier = UUID()
+        // Cancel any pending finalize fallback so a stale timer from a previous
+        // session can't fire mid-way through the next one and kill it.
+        finalizeFallbackWorkItem?.cancel()
+        finalizeFallbackWorkItem = nil
         activeTranscriptionSession = nil
         draftCallbacks = nil
         activeStartSource = nil
