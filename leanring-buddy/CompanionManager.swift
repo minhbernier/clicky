@@ -146,6 +146,22 @@ final class CompanionManager: ObservableObject {
         return AgentArtifactsService(proxyBaseURL: Self.workerBaseURL)
     }()
 
+    /// Drives the proactive-suggestion HUD: a dwell timer that watches the
+    /// frontmost app and, once enabled, asks the proxy's /proactive-intents
+    /// route whether to surface a small suggestion bubble. Off by default and
+    /// never auto-started — see isProactiveEnabled / setProactiveEnabled.
+    private lazy var proactiveManager: ProactiveManager = {
+        return ProactiveManager(
+            proxyBaseURL: Self.workerBaseURL,
+            sendToMainChat: { [weak self] text in
+                // nil agentTaskID routes to the main chat path (see
+                // sendFollowUpText) rather than any specific agent task — an
+                // "Act on it" nudge isn't scoped to an existing task thread.
+                self?.sendFollowUpText(text, toAgentTaskID: nil)
+            }
+        )
+    }()
+
     /// In-flight artifact fetches keyed by agent task id. Two turns of the same
     /// task can settle close together (e.g. a confirmation reply immediately
     /// followed by the completion reply), each kicking off its own fetch; without
@@ -262,6 +278,31 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    /// User preference for whether Micky should occasionally surface a
+    /// proactive suggestion based on which app has been focused for a while.
+    /// OFF by default (opt-in, unlike the cursor toggle) — persisted so the
+    /// choice survives app restarts. `UserDefaults.bool(forKey:)` already
+    /// returns false when the key has never been set, so no extra
+    /// "was this ever set" check is needed here (contrast isClickyCursorEnabled
+    /// above, which defaults to true and does need one).
+    @Published var isProactiveEnabled: Bool = UserDefaults.standard.bool(forKey: "isProactiveEnabled")
+
+    /// Mirrors setClickyCursorEnabled's shape exactly: update the published
+    /// flag, persist it, then start/stop the underlying subsystem — here,
+    /// ProactiveManager's dwell timer and any bubble it has on screen.
+    /// ProactiveManager.start()/stop() also persist this same UserDefaults key
+    /// themselves (so the class is correct even if ever driven directly), so
+    /// this write is a harmless, idempotent duplicate.
+    func setProactiveEnabled(_ enabled: Bool) {
+        isProactiveEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "isProactiveEnabled")
+        if enabled {
+            proactiveManager.start()
+        } else {
+            proactiveManager.stop()
+        }
+    }
+
     /// Whether the upstream Farza intro video + theme music play during
     /// onboarding. This fork (Micky) disables them by default so onboarding is
     /// effectively skipped — the cursor just appears. Set the Info.plist key
@@ -328,6 +369,13 @@ final class CompanionManager: ObservableObject {
             overlayWindowManager.hasShownOverlayBefore = true
             overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
             isOverlayVisible = true
+        }
+
+        // Resume the proactive-suggestion dwell timer if the user had it on
+        // in a previous session. This is not an auto-enable — it only fires
+        // when the persisted flag is already true from an explicit toggle.
+        if isProactiveEnabled {
+            proactiveManager.start()
         }
     }
 
@@ -440,6 +488,7 @@ final class CompanionManager: ObservableObject {
         audioPowerCancellable?.cancel()
         accessibilityCheckTimer?.invalidate()
         accessibilityCheckTimer = nil
+        proactiveManager.stop()
     }
 
     func refreshAllPermissions() {

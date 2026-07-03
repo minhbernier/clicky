@@ -124,6 +124,12 @@ struct CompanionPanelView: View {
                 Spacer()
                     .frame(height: 6)
 
+                proactiveSuggestionsToggleRow
+                    .padding(.horizontal, 16)
+
+                Spacer()
+                    .frame(height: 6)
+
                 activeIntegrationsRow
                     .padding(.horizontal, 16)
             }
@@ -638,6 +644,46 @@ struct CompanionPanelView: View {
             Toggle("", isOn: Binding(
                 get: { companionManager.isClickyCursorEnabled },
                 set: { companionManager.setClickyCursorEnabled($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .tint(DS.Colors.accent)
+            .scaleEffect(0.8)
+        }
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Proactive Suggestions Toggle
+
+    /// "Proactive suggestions" toggle — same Toggle binding pattern as
+    /// showClickyCursorToggleRow above, wired to CompanionManager's
+    /// isProactiveEnabled/setProactiveEnabled. See ProactiveManager for what
+    /// this starts/stops: a dwell timer that watches the frontmost app and,
+    /// once it's been focused long enough, asks the proxy whether to surface
+    /// a small suggestion bubble.
+    private var proactiveSuggestionsToggleRow: some View {
+        HStack {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "lightbulb")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .frame(width: 16)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Proactive suggestions")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                    Text("Micky occasionally suggests a next step for what you're doing.")
+                        .font(.system(size: 10))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+            }
+
+            Spacer()
+
+            Toggle("", isOn: Binding(
+                get: { companionManager.isProactiveEnabled },
+                set: { companionManager.setProactiveEnabled($0) }
             ))
             .toggleStyle(.switch)
             .labelsHidden()
