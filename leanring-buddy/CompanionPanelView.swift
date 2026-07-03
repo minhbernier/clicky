@@ -24,6 +24,9 @@ struct CompanionPanelView: View {
     /// instead of the task list.
     @State private var openedAgentTaskID: UUID? = nil
     @State private var agentFollowUpText: String = ""
+    /// Filters the Agents tab list below by title/transcript/artifact text.
+    /// Only surfaced once the list is long enough to be worth searching.
+    @State private var agentSearchQuery: String = ""
 
     /// The tab switcher and Agents tab only make sense once the user is fully
     /// set up; during onboarding/permissions the panel stays single-purpose.
@@ -858,7 +861,8 @@ struct CompanionPanelView: View {
     }
 
     private var agentTaskListView: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        let filteredAgentTasks = filteredAgentTasks
+        return VStack(alignment: .leading, spacing: 0) {
             if companionManager.agentTaskStore.agentTasks.isEmpty {
                 VStack(spacing: 6) {
                     Image(systemName: "sparkles")
@@ -877,28 +881,103 @@ struct CompanionPanelView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 24)
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 10) {
-                        ForEach(companionManager.agentTaskStore.agentTasks) { agentTask in
-                            AgentTaskCardView(
-                                agentTask: agentTask,
-                                isSelected: false,
-                                onSelect: {
-                                    companionManager.agentTaskStore.selectedAgentTaskID = agentTask.id
-                                    openedAgentTaskID = agentTask.id
-                                },
-                                onDismiss: {
-                                    companionManager.agentTaskStore.removeAgentTask(withID: agentTask.id)
-                                }
-                            )
-                        }
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 12)
+                // Search only earns its keep once there's enough to search
+                // through — below that, scanning the list by eye is faster.
+                // Once a query is active, keep the field (and its clear button)
+                // visible even if dismissing tasks drops the count back down,
+                // so the user always has a way to clear the filter.
+                if companionManager.agentTaskStore.agentTasks.count > 3 || !agentSearchQuery.isEmpty {
+                    agentSearchField
+                        .padding(.horizontal, 16)
+                        .padding(.top, 12)
                 }
-                .frame(maxHeight: 320)
+
+                if filteredAgentTasks.isEmpty {
+                    Text("No matching agents")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 24)
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 10) {
+                            ForEach(filteredAgentTasks) { agentTask in
+                                AgentTaskCardView(
+                                    agentTask: agentTask,
+                                    isSelected: false,
+                                    onSelect: {
+                                        companionManager.agentTaskStore.selectedAgentTaskID = agentTask.id
+                                        openedAgentTaskID = agentTask.id
+                                    },
+                                    onDismiss: {
+                                        companionManager.agentTaskStore.removeAgentTask(withID: agentTask.id)
+                                    }
+                                )
+                            }
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 12)
+                    }
+                    .frame(maxHeight: 320)
+                }
             }
         }
+    }
+
+    /// Compact search input shown above the Agents tab list once there are
+    /// more than a handful of tasks to sift through.
+    private var agentSearchField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(DS.Colors.textTertiary)
+
+            TextField("Search agents…", text: $agentSearchQuery)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundColor(DS.Colors.textPrimary)
+
+            if !agentSearchQuery.isEmpty {
+                Button(action: { agentSearchQuery = "" }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+                .buttonStyle(.plain)
+                .pointerCursor()
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .fill(Color.white.opacity(0.08))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+        )
+    }
+
+    /// Tasks matching `agentSearchQuery`, preserving the store's sort order
+    /// (newest first). An empty/whitespace-only query short-circuits to the
+    /// full list without touching per-task text.
+    private var filteredAgentTasks: [AgentTask] {
+        let trimmedQuery = agentSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedQuery.isEmpty else { return companionManager.agentTaskStore.agentTasks }
+        return companionManager.agentTaskStore.agentTasks.filter { agentTask in
+            agentTaskMatchesSearch(agentTask, query: trimmedQuery)
+        }
+    }
+
+    /// Case-insensitive match across the task title, every transcript
+    /// message's text, and every artifact's display title.
+    private func agentTaskMatchesSearch(_ agentTask: AgentTask, query: String) -> Bool {
+        if agentTask.title.localizedCaseInsensitiveContains(query) { return true }
+        if agentTask.transcript.contains(where: { $0.text.localizedCaseInsensitiveContains(query) }) { return true }
+        if agentTask.artifacts.contains(where: { $0.title.localizedCaseInsensitiveContains(query) }) { return true }
+        return false
     }
 
     private func agentTaskDetailView(for agentTask: AgentTask) -> some View {
