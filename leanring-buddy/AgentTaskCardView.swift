@@ -81,6 +81,10 @@ struct AgentTaskCardView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+
+            if !agentTask.artifacts.isEmpty {
+                AgentTaskArtifactsRow(artifacts: agentTask.artifacts)
+            }
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -112,6 +116,70 @@ struct AgentTaskCardView: View {
         .pointerCursor()
         .onHover { hovering in
             isHovered = hovering
+        }
+    }
+}
+
+/// A single artifact chip on a task card: a doc icon + short title, clickable
+/// to reveal the file in its default app via NSWorkspace. Rendered dimmed and
+/// disabled with a strikethrough title when the file no longer exists on disk
+/// (moved or deleted since the proxy recorded it) — the agent still did
+/// produce it, so the chip stays visible rather than disappearing.
+struct AgentTaskArtifactChip: View {
+    let artifact: AgentTaskArtifact
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: openArtifact) {
+            HStack(spacing: 4) {
+                Image(systemName: "doc.text")
+                    .font(.system(size: 10, weight: .medium))
+                Text(artifact.title)
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+                    .strikethrough(!artifact.exists)
+            }
+            // Titles are unbounded proxy data — cap the chip's content width so a
+            // long title truncates with an ellipsis instead of drawing past the
+            // task card's edge. ConnectorChipFlowLayout sizes each subview at its
+            // own ideal width, so without this cap nothing else constrains it.
+            .frame(maxWidth: 240, alignment: .leading)
+            .foregroundColor(artifact.exists ? DS.Colors.textPrimary : DS.Colors.textTertiary)
+            .padding(.vertical, 5)
+            .padding(.horizontal, 9)
+            .background(
+                Capsule().fill(artifact.exists && isHovered ? DS.Colors.surface4 : DS.Colors.surface3)
+            )
+            .overlay(
+                Capsule().strokeBorder(DS.Colors.borderSubtle, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(!artifact.exists)
+        .pointerCursor(isEnabled: artifact.exists)
+        .onHover { hovering in
+            isHovered = hovering
+        }
+    }
+
+    private func openArtifact() {
+        NSWorkspace.shared.open(URL(fileURLWithPath: artifact.path))
+    }
+}
+
+/// A compact, wrapping row of artifact chips shown under a task's preview
+/// text once the proxy has recorded files for its latest completed turn.
+/// Reuses ConnectorChipFlowLayout (defined in ConnectorRecommendationView.swift)
+/// so chips wrap onto new rows instead of overflowing the card's fixed width.
+struct AgentTaskArtifactsRow: View {
+    let artifacts: [AgentTaskArtifact]
+
+    var body: some View {
+        ConnectorChipFlowLayout(horizontalSpacing: 6, verticalSpacing: 6) {
+            ForEach(artifacts) { artifact in
+                AgentTaskArtifactChip(artifact: artifact)
+            }
         }
     }
 }

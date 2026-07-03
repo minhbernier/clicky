@@ -68,6 +68,18 @@ final class AgentTaskStore: ObservableObject {
         }
     }
 
+    /// Attaches the artifacts the proxy recorded for this task (a diff, a
+    /// screenshot, a saved doc) so the card can render them as clickable
+    /// chips. Replaces any previously attached artifacts — safe because each
+    /// fetch already returns the proxy's cumulative, deduped-by-path set for
+    /// the whole task (merged across all of its turns), not just the latest
+    /// turn's, so a plain replace can't drop artifacts recorded earlier.
+    func setArtifacts(_ artifacts: [AgentTaskArtifact], forTaskWithID agentTaskID: UUID) {
+        mutateAgentTask(withID: agentTaskID) { agentTask in
+            agentTask.artifacts = artifacts
+        }
+    }
+
     /// Replaces a task's title — used when the model-generated label arrives
     /// asynchronously and upgrades the instant placeholder name.
     func setTitle(_ title: String, forTaskWithID agentTaskID: UUID) {

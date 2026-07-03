@@ -139,6 +139,21 @@ final class CompanionManager: ObservableObject {
         return ConnectorRecommendationService(proxyBaseURL: Self.workerBaseURL)
     }()
 
+    /// Fetches artifacts (a diff, a screenshot, a saved doc) the proxy recorded
+    /// for an agent task's latest turn, so the task card can render them as
+    /// clickable chips. See AgentArtifactsService for details.
+    private lazy var agentArtifactsService: AgentArtifactsService = {
+        return AgentArtifactsService(proxyBaseURL: Self.workerBaseURL)
+    }()
+
+    /// In-flight artifact fetches keyed by agent task id. Two turns of the same
+    /// task can settle close together (e.g. a confirmation reply immediately
+    /// followed by the completion reply), each kicking off its own fetch; without
+    /// tracking these, the two requests could land out of order and let a stale
+    /// response overwrite a newer one. `fetchArtifactsAndAttach` cancels whatever
+    /// is already tracked for a task id before starting a new fetch for it.
+    private var artifactFetchTasksByAgentTaskID: [UUID: Task<Void, Never>] = [:]
+
     /// The connector recommendation to surface right now, if any.
     /// ConnectorRecommendationManager observes this to show/hide the popup.
     @Published private(set) var pendingConnectorRecommendation: ConnectorRecommendation?
@@ -822,6 +837,42 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    // MARK: - Agent Task Artifacts
+
+    /// Fetches whatever artifacts the proxy has recorded for `agentTaskID` and
+    /// attaches them to its card. Called from every place a turn settles for
+    /// that task (normal completion, needs-confirmation, and the cancellation
+    /// settle path for a superseded turn), since each of those is a point where
+    /// the proxy may have recorded new files.
+    ///
+    /// Cancels any fetch already in flight for the same task id before starting
+    /// a new one, so two overlapping fetches can't land out of order and leave
+    /// stale data attached (last-writer-wins with the older response overwriting
+    /// the newer one). Fire-and-forget: never blocks the voice pipeline, and a
+    /// failed or cancelled fetch just means no artifacts row appears — the card
+    /// itself already settled.
+    private func fetchArtifactsAndAttach(toAgentTaskID agentTaskID: UUID) {
+        artifactFetchTasksByAgentTaskID[agentTaskID]?.cancel()
+        let agentID = agentTaskID.uuidString
+        artifactFetchTasksByAgentTaskID[agentTaskID] = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                // Only clear this task's own dictionary slot on a normal finish.
+                // `.cancel()` above is the only place that cancels one of these
+                // tasks, so landing here cancelled means a newer fetch for this
+                // same agentTaskID already overwrote the dictionary entry —
+                // clearing it here would erase that newer task's entry instead
+                // of this (superseded) one's.
+                if !Task.isCancelled {
+                    self.artifactFetchTasksByAgentTaskID[agentTaskID] = nil
+                }
+            }
+            let fetchedArtifacts = await self.agentArtifactsService.artifacts(forAgentID: agentID)
+            guard !Task.isCancelled, !fetchedArtifacts.isEmpty else { return }
+            self.agentTaskStore.setArtifacts(fetchedArtifacts, forTaskWithID: agentTaskID)
+        }
+    }
+
     /// Captures a screenshot, sends it along with the transcript to Claude,
     /// and plays the response aloud via the active TTS client. The cursor stays
     /// in the spinner/processing state until TTS audio begins playing.
@@ -1022,6 +1073,16 @@ final class CompanionManager: ObservableObject {
                         ? .needsConfirmation
                         : .done
                     agentTaskStore.updateStatus(resolvedStatus, forTaskWithID: effectiveAgentTaskID)
+
+                    // Once a turn settles — either fully Done, or waiting on the
+                    // user for confirmation (the proxy already ran the described
+                    // action and may have recorded artifacts for it before pausing
+                    // on the power gate) — fetch whatever artifacts the proxy has
+                    // recorded for this agent id in the background and attach
+                    // them to the card.
+                    if resolvedStatus == .done || resolvedStatus == .needsConfirmation {
+                        fetchArtifactsAndAttach(toAgentTaskID: effectiveAgentTaskID)
+                    }
                 }
 
                 // Play the response via TTS. Keep the spinner (processing state)
@@ -1049,11 +1110,15 @@ final class CompanionManager: ObservableObject {
             } catch is CancellationError {
                 // User spoke again — this turn was superseded. If it belonged to a
                 // task that is NOT the one now in flight, don't leave that card
-                // spinning forever; settle it back to done (its prior reply stands).
+                // spinning forever; settle it back to done (its prior reply stands)
+                // and still fetch — the cancelled turn may have run far enough on
+                // the proxy side to have recorded artifacts before this app-side
+                // cancellation happened.
                 if let effectiveAgentTaskID,
                    effectiveAgentTaskID != currentInFlightAgentTaskID,
                    agentTaskStore.agentTask(withID: effectiveAgentTaskID)?.status == .running {
                     agentTaskStore.updateStatus(.done, forTaskWithID: effectiveAgentTaskID)
+                    fetchArtifactsAndAttach(toAgentTaskID: effectiveAgentTaskID)
                 }
             } catch {
                 ClickyAnalytics.trackResponseError(error: error.localizedDescription)

@@ -56,6 +56,24 @@ struct AgentTaskMessage: Identifiable {
     }
 }
 
+/// A single file artifact the proxy recorded for an agent task's latest
+/// completed turn (a diff, a screenshot, a saved doc, etc.), fetched from the
+/// proxy's `/agents/{id}/artifacts` route once the turn settles to `.done`.
+/// Rendered as a clickable chip on the task card.
+struct AgentTaskArtifact: Identifiable, Equatable {
+    /// The artifact's absolute filesystem path. Also its stable identity —
+    /// the proxy doesn't assign artifacts a separate id, and a path is unique
+    /// per file.
+    var id: String { path }
+    let path: String
+    /// Short display label for the chip (e.g. "Diff", "Screenshot").
+    let title: String
+    /// Whether the file still existed on disk as of the fetch. `false` keeps
+    /// the chip visible but dimmed/disabled — the agent did produce it, even
+    /// if it's since been moved or deleted — rather than hiding it entirely.
+    let exists: Bool
+}
+
 /// A single agent/task shown in the task panel and the Agents tab. Represents
 /// one ongoing line of work with Micky's power session and its full transcript.
 struct AgentTask: Identifiable {
@@ -67,6 +85,11 @@ struct AgentTask: Identifiable {
     var transcript: [AgentTaskMessage]
     let createdAt: Date
     var updatedAt: Date
+    /// The proxy's cumulative set of artifacts for this task: every file it
+    /// has recorded across all of the task's turns so far, deduped by path —
+    /// not just the most recent turn's. Empty until the first successful
+    /// fetch after a turn settles to `.done` or `.needsConfirmation`.
+    var artifacts: [AgentTaskArtifact] = []
 
     /// The most recent assistant reply, used as the card's one-line preview.
     var latestAssistantMessageText: String? {

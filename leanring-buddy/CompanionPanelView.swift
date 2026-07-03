@@ -949,6 +949,14 @@ struct CompanionPanelView: View {
                 }
             }
 
+            // Artifacts the proxy recorded for this task's latest completed
+            // turn (a diff, a screenshot, a saved doc), if any.
+            if !agentTask.artifacts.isEmpty {
+                AgentTaskArtifactsRow(artifacts: agentTask.artifacts)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 4)
+            }
+
             // Text + Voice follow-up controls.
             agentFollowUpControls(for: agentTask)
                 .padding(.horizontal, 16)
