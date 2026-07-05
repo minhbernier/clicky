@@ -130,6 +130,12 @@ struct CompanionPanelView: View {
                 Spacer()
                     .frame(height: 6)
 
+                handsFreeConversationToggleRow
+                    .padding(.horizontal, 16)
+
+                Spacer()
+                    .frame(height: 6)
+
                 activeIntegrationsRow
                     .padding(.horizontal, 16)
             }
@@ -684,6 +690,47 @@ struct CompanionPanelView: View {
             Toggle("", isOn: Binding(
                 get: { companionManager.isProactiveEnabled },
                 set: { companionManager.setProactiveEnabled($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .tint(DS.Colors.accent)
+            .scaleEffect(0.8)
+        }
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Hands-Free Conversation Toggle
+
+    /// "Hands-free conversation" toggle — same Toggle binding pattern as
+    /// showClickyCursorToggleRow/proactiveSuggestionsToggleRow above, wired to
+    /// CompanionManager's isHandsFreeEnabled/setHandsFreeEnabled. OFF by
+    /// default (opt-in). This is continuous TURN-TAKING, not full duplex:
+    /// Micky reopens the mic only after it has completely finished speaking a
+    /// reply, never while still talking, so a conversation can flow without
+    /// holding a key down for every turn.
+    private var handsFreeConversationToggleRow: some View {
+        HStack {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "waveform")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .frame(width: 16)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Hands-free conversation")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                    Text("Micky reopens the mic after replying, so you can talk back without holding a key.")
+                        .font(.system(size: 10))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+            }
+
+            Spacer()
+
+            Toggle("", isOn: Binding(
+                get: { companionManager.isHandsFreeEnabled },
+                set: { companionManager.setHandsFreeEnabled($0) }
             ))
             .toggleStyle(.switch)
             .labelsHidden()

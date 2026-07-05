@@ -72,7 +72,19 @@ final class CompanionManager: ObservableObject {
 
     /// True while a voice follow-up dictation session (started from a tab button,
     /// not the hardware shortcut) is recording. Drives the Voice button's UI.
+    /// Also true while hands-free conversation mode has auto-reopened the mic
+    /// for the user's next spoken turn — see isHandsFreeAutoListening below for
+    /// how that specific case is distinguished from a manual tab-button start.
     @Published private(set) var isRecordingVoiceFollowUp = false
+
+    /// True only when the CURRENT isRecordingVoiceFollowUp session was opened
+    /// automatically by hands-free conversation mode's re-arm (as opposed to a
+    /// manual tap on a task card's Voice button). Lets setHandsFreeEnabled(false)
+    /// tell the difference: disabling hands-free mid-listen should stop an
+    /// auto-opened mic immediately, but must never stop a session the user
+    /// started manually. Always toggles together with isRecordingVoiceFollowUp
+    /// via endVoiceListeningSession(), so it never goes stale.
+    private var isHandsFreeAutoListening = false
 
     /// The agent task whose turn is currently in flight, if any. Used so a turn
     /// that gets superseded (cancelled) by a newer, unrelated request can settle
@@ -203,6 +215,39 @@ final class CompanionManager: ObservableObject {
     /// Scheduled hide for transient cursor mode — cancelled if the user
     /// speaks again before the delay elapses.
     private var transientHideTask: Task<Void, Never>?
+    /// Delayed re-arm of the mic for hands-free conversation mode, scheduled
+    /// from the reply-settle block in sendTranscriptToClaudeWithScreenshot.
+    /// Cancellable so a new turn, a manual voice/push-to-talk start, or the
+    /// user disabling hands-free can all stop it before it ever opens the mic.
+    /// See scheduleHandsFreeRearmIfNeeded() for every guard checked before it fires.
+    private var handsFreeRearmTask: Task<Void, Never>?
+
+    /// Voice-activity monitor for an in-progress hands-free auto-listen turn.
+    /// The dictation pipeline itself is hold-to-talk with no end-of-speech
+    /// detection — nothing else ever calls stop for an auto-opened mic — so
+    /// this polls currentAudioPowerLevel (~every 100ms, Task.sleep-based, not
+    /// a busy-wait) to detect when the user has finished talking and finalize
+    /// the turn. Only ever started for an auto-listen (isHandsFreeAutoListen
+    /// == true); manual push-to-talk and the Voice button rely on their own
+    /// explicit stop and never have a monitor task running. See
+    /// startHandsFreeListenMonitor() for the full detection + timeout logic.
+    /// Cancelled and nil'd at every teardown point — endVoiceListeningSession(),
+    /// setHandsFreeEnabled(false), cancelInFlightResponseForBargeIn(), stop(),
+    /// and the top of scheduleHandsFreeRearmIfNeeded() — mirroring how
+    /// handsFreeRearmTask above is managed.
+    private var handsFreeListenMonitorTask: Task<Void, Never>?
+
+    /// Count of consecutive hands-free auto-listen turns that ended with no
+    /// real speech: either total silence (the monitor's no-speech/max-listen
+    /// backstop) or a transcript too short to plausibly be real ("you",
+    /// "thank you" — common STT hallucinations on near-silent audio). Without
+    /// this, a silent/hallucinated turn would still submit, get a reply, and
+    /// re-arm the mic — looping forever on background noise. Consulted by
+    /// scheduleHandsFreeRearmIfNeeded, which suspends auto re-arming once this
+    /// reaches handsFreeMaxConsecutiveSilentTurns. Reset to 0 by any real
+    /// hands-free turn that submits, or by any manual push-to-talk /
+    /// Voice-button turn — see resetHandsFreeSilentTurnCounter().
+    private var handsFreeConsecutiveSilentTurns = 0
 
     /// True when all three required permissions (accessibility, screen recording,
     /// microphone) are granted. Used by the panel to show a single "all good" state.
@@ -300,6 +345,53 @@ final class CompanionManager: ObservableObject {
             proactiveManager.start()
         } else {
             proactiveManager.stop()
+        }
+    }
+
+    /// User preference for whether Micky should automatically reopen the mic
+    /// for the user's next spoken turn right after finishing a reply, so a
+    /// conversation can flow without holding push-to-talk for every turn. OFF
+    /// by default (opt-in) — persisted so the choice survives app restarts.
+    /// `UserDefaults.bool(forKey:)` already returns false when the key has
+    /// never been set, so no extra "was this ever set" check is needed here
+    /// (same reasoning as isProactiveEnabled above).
+    ///
+    /// IMPORTANT — this is continuous TURN-TAKING, not full duplex. The mic is
+    /// only ever reopened once TTS playback has completely finished (see the
+    /// settle block in sendTranscriptToClaudeWithScreenshot and
+    /// scheduleHandsFreeRearmIfNeeded below); Micky never listens while it is
+    /// speaking, so it can never hear its own voice.
+    @Published var isHandsFreeEnabled: Bool = UserDefaults.standard.bool(forKey: "isHandsFreeConversationEnabled")
+
+    /// Mirrors setClickyCursorEnabled's shape exactly: update the published
+    /// flag, then persist it. Disabling mid-conversation additionally cancels
+    /// any pending re-arm (so it can never fire after this) and, if hands-free
+    /// had already opened the mic for this turn and is sitting there listening,
+    /// stops that listening immediately — the user just asked to stop the
+    /// automatic behavior, so it shouldn't keep going for the turn already in
+    /// progress. A manually-started voice follow-up (tab button) is left alone,
+    /// since isHandsFreeAutoListening is only true for hands-free's own re-arm.
+    ///
+    /// Stopping an open auto-listen here DISCARDS whatever was captured so far
+    /// (cancelCurrentDictation) rather than finalizing+submitting it — the user
+    /// is turning the feature off, not asking for one more reply, so disabling
+    /// must not trigger a surprise extra turn. This is deliberately different
+    /// from toggleVoiceFollowUp's own manual toggle-off, which still finalizes
+    /// + submits via stopPushToTalkFromKeyboardShortcut() because there the user
+    /// explicitly asked to end that turn, not discard it.
+    func setHandsFreeEnabled(_ enabled: Bool) {
+        isHandsFreeEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "isHandsFreeConversationEnabled")
+        guard !enabled else { return }
+
+        handsFreeRearmTask?.cancel()
+        handsFreeRearmTask = nil
+        handsFreeListenMonitorTask?.cancel()
+        handsFreeListenMonitorTask = nil
+
+        if isHandsFreeAutoListening {
+            buddyDictationManager.cancelCurrentDictation(preserveDraftText: false)
+            endVoiceListeningSession()
         }
     }
 
@@ -480,6 +572,10 @@ final class CompanionManager: ObservableObject {
         buddyDictationManager.cancelCurrentDictation()
         overlayWindowManager.hideOverlay()
         transientHideTask?.cancel()
+        handsFreeRearmTask?.cancel()
+        handsFreeRearmTask = nil
+        handsFreeListenMonitorTask?.cancel()
+        handsFreeListenMonitorTask = nil
 
         currentResponseTask?.cancel()
         currentResponseTask = nil
@@ -669,13 +765,14 @@ final class CompanionManager: ObservableObject {
                     self.voiceState = .processing
                 } else {
                     self.voiceState = .idle
-                    // A button-initiated voice follow-up that ended without
-                    // producing a transcript (empty utterance, denied permission,
-                    // or aborted start) never runs its submit closure, so reset the
-                    // recording flag here so the Voice button doesn't stay stuck on
-                    // its red "stop" state, and fade any transiently-shown overlay.
+                    // A button-initiated voice follow-up (or a hands-free
+                    // auto-listen) that ended without producing a transcript
+                    // (empty utterance, denied permission, or aborted start)
+                    // never runs its submit closure, so reset the recording
+                    // flags here so the Voice button doesn't stay stuck on its
+                    // red "stop" state, and fade any transiently-shown overlay.
                     if self.isRecordingVoiceFollowUp {
-                        self.isRecordingVoiceFollowUp = false
+                        self.endVoiceListeningSession()
                         self.scheduleTransientHideIfNeeded()
                     }
                     // If the user pressed and released the hotkey without
@@ -756,6 +853,11 @@ final class CompanionManager: ObservableObject {
                     submitDraftText: { [weak self] finalTranscript in
                         guard let self else { return }
                         self.lastTranscript = finalTranscript
+                        // A real, manually-spoken turn — clears any streak of
+                        // silent/trivial hands-free auto-listen turns that
+                        // may have built up (see handsFreeConsecutiveSilentTurns),
+                        // proving the user is actually there.
+                        self.resetHandsFreeSilentTurnCounter()
                         print("🗣️ Companion received transcript: \(finalTranscript)")
                         ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
                         // Hardware push-to-talk is always a fresh request — let the
@@ -834,12 +936,27 @@ final class CompanionManager: ObservableObject {
     /// `bindVoiceStateObservation`'s `.responding` guard drop every later state
     /// update and can strand a queued typed follow-up. Queued follow-ups are left
     /// intact so they run after the new turn settles.
+    ///
+    /// Also cancels any pending hands-free re-arm: this function runs whenever
+    /// a hardware push-to-talk press or a voice follow-up start "takes the
+    /// mic" (see handleShortcutTransition and beginVoiceListening), and none
+    /// of those should ever race against a delayed hands-free re-arm trying to
+    /// open the mic on top of them.
     private func cancelInFlightResponseForBargeIn() {
         currentResponseTask?.cancel()
         currentResponseTask = nil
         currentInFlightAgentTaskID = nil
         textToSpeechClient.stopPlayback()
         voiceState = .idle
+        handsFreeRearmTask?.cancel()
+        handsFreeRearmTask = nil
+        // A barge-in supersedes whatever hands-free auto-listen turn might
+        // still be getting monitored for end-of-speech — that turn no longer
+        // owns the mic (or is about to be replaced), so its monitor must die
+        // with it. See handsFreeListenMonitorTask's declaration for every
+        // other teardown point.
+        handsFreeListenMonitorTask?.cancel()
+        handsFreeListenMonitorTask = nil
     }
 
     // MARK: - Connector recommendations
@@ -1188,7 +1305,97 @@ final class CompanionManager: ObservableObject {
                 currentInFlightAgentTaskID = nil
                 scheduleTransientHideIfNeeded()
                 processNextQueuedFollowUpIfPipelineIdle()
+
+                // Hands-free conversation mode: if enabled, and nothing else
+                // just picked the pipeline back up (a drained queued follow-up
+                // above would already have set currentResponseTask again),
+                // schedule a delayed re-arm of the mic for the user's next
+                // spoken turn. See scheduleHandsFreeRearmIfNeeded for the full
+                // set of guards — this is turn-taking, never duplex, so the
+                // mic is never opened while TTS is playing.
+                scheduleHandsFreeRearmIfNeeded()
             }
+        }
+    }
+
+    /// Schedules a delayed re-arm of the mic for hands-free conversation mode.
+    /// Called only from the reply-settle block above, i.e. only once a turn
+    /// has fully finished (including its TTS playback — the settle block is
+    /// reached after `sendTranscriptToClaudeWithScreenshot`'s `while
+    /// textToSpeechClient.isPlaying` wait completes).
+    ///
+    /// SAFETY: this feature is continuous TURN-TAKING, not full duplex. The
+    /// mic must NEVER open while Micky is speaking, or it will hear its own
+    /// voice. Guards are applied twice — once here, synchronously, before
+    /// scheduling anything, and again inside the delayed task right before it
+    /// actually opens the mic — because the world can change during the delay
+    /// (the user can disable hands-free, press push-to-talk, tap a task's
+    /// Voice button, or a brand-new turn can start). If anything is
+    /// uncertain, this errs toward NOT auto-opening the mic.
+    ///
+    /// Always cancels whatever was previously in `handsFreeRearmTask` first,
+    /// so only ever one re-arm is pending at a time, and any of the other
+    /// cancellation points (setHandsFreeEnabled(false),
+    /// cancelInFlightResponseForBargeIn, or stop()) can reliably kill it.
+    private func scheduleHandsFreeRearmIfNeeded() {
+        handsFreeRearmTask?.cancel()
+        handsFreeRearmTask = nil
+        // Any monitor watching a previous auto-listen turn has already done
+        // its job by the time we get here (that turn already settled) —
+        // mirror handsFreeRearmTask's own cancel-first-thing pattern so a
+        // stale monitor can never poll past its turn's lifetime.
+        handsFreeListenMonitorTask?.cancel()
+        handsFreeListenMonitorTask = nil
+
+        guard isHandsFreeEnabled else { return }
+        // A queued typed follow-up drained above already started a new turn —
+        // don't stack a re-arm on top of it.
+        guard currentResponseTask == nil else { return }
+        // Nothing else should already have the mic.
+        guard !isRecordingVoiceFollowUp, !buddyDictationManager.isDictationInProgress else { return }
+        // Never schedule while audio is still playing — belt-and-suspenders on
+        // top of the settle block only running after playback ends.
+        guard !textToSpeechClient.isPlaying else { return }
+        // Loop / silence-hallucination protection: once several consecutive
+        // auto-listen turns in a row have produced no real speech (STT
+        // hallucinating short junk on background noise, or genuine silence
+        // timing out), stop re-opening the mic on our own. This does NOT
+        // disable the isHandsFreeEnabled toggle — it just halts the automatic
+        // loop until the user proves they're actually there with a manual
+        // push-to-talk or Voice-button turn, which resets the streak (see
+        // resetHandsFreeSilentTurnCounter). Without this a quiet or noisy
+        // room would submit junk, get a reply, re-arm, and repeat forever.
+        guard handsFreeConsecutiveSilentTurns < Self.handsFreeMaxConsecutiveSilentTurns else {
+            print("🎙️ Hands-free: \(handsFreeConsecutiveSilentTurns) consecutive silent turns — suspending auto re-arm until a manual turn")
+            return
+        }
+
+        handsFreeRearmTask = Task { @MainActor [weak self] in
+            // Let the tail of the spoken reply finish decaying acoustically
+            // before the mic opens, so it can't catch the last words of
+            // Micky's own voice. A single fixed-length sleep — not a
+            // busy-wait / tight polling loop.
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard let self, !Task.isCancelled else { return }
+
+            // Re-check every guard right before opening the mic. Anything
+            // could have changed during the 500ms delay — the user could have
+            // toggled hands-free off, pressed push-to-talk, tapped a task's
+            // Voice button, or a brand-new response/TTS turn could already be
+            // in flight. NEVER open the mic while TTS is playing, and if
+            // there's any doubt at all, skip the re-arm rather than risk
+            // capturing Micky's own voice or stepping on something else.
+            guard self.isHandsFreeEnabled else { return }
+            guard self.currentResponseTask == nil else { return }
+            guard !self.isRecordingVoiceFollowUp, !self.buddyDictationManager.isDictationInProgress else { return }
+            guard !self.textToSpeechClient.isPlaying else { return }
+
+            self.handsFreeRearmTask = nil
+            // Re-open the mic for the user's next turn via the SAME primitive
+            // toggleVoiceFollowUp uses — nil agentTaskID routes the resulting
+            // transcript to the main chat, since a hands-free re-arm isn't
+            // scoped to any particular agent task card.
+            self.beginVoiceListening(forAgentTaskID: nil, isHandsFreeAutoListen: true)
         }
     }
 
@@ -1253,14 +1460,264 @@ final class CompanionManager: ObservableObject {
     /// agent task, driven by the Agents tab's Voice button rather than the
     /// hardware push-to-talk shortcut. The resulting transcript is attached to
     /// the given task when it finalizes.
+    ///
+    /// This is the manual entry point — the toggle only ever stops or starts a
+    /// user-initiated session. The actual "start listening" mechanics live in
+    /// beginVoiceListening(forAgentTaskID:) below, shared with hands-free
+    /// conversation mode's automatic re-arm so the barge-in/dictation logic
+    /// exists in exactly one place.
     func toggleVoiceFollowUp(forAgentTaskID agentTaskID: UUID?) {
         // If a follow-up dictation is already running, stop it (toggle off).
         if isRecordingVoiceFollowUp {
             buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
-            isRecordingVoiceFollowUp = false
+            endVoiceListeningSession()
             return
         }
 
+        beginVoiceListening(forAgentTaskID: agentTaskID)
+    }
+
+    /// Clears both the recording flag and the hands-free-auto-listen flag
+    /// together — they always change in lockstep, so every place that used to
+    /// reset isRecordingVoiceFollowUp alone now goes through here instead, to
+    /// keep isHandsFreeAutoListening from ever going stale. Also tears down
+    /// the hands-free listen monitor task (see handsFreeListenMonitorTask) —
+    /// it only ever makes sense while a hands-free auto-listen session is
+    /// open, so it always ends here too, whichever path ends the session.
+    private func endVoiceListeningSession() {
+        isRecordingVoiceFollowUp = false
+        isHandsFreeAutoListening = false
+        handsFreeListenMonitorTask?.cancel()
+        handsFreeListenMonitorTask = nil
+    }
+
+    // MARK: - Hands-Free Auto-Listen (Voice Activity Detection)
+    //
+    // The dictation pipeline (BuddyDictationManager) is hold-to-talk — audio
+    // keeps recording until something explicitly calls stop. That's fine for
+    // the hardware shortcut and the manual Voice button, where the user
+    // themselves controls start/stop. But hands-free's auto re-arm opens the
+    // mic programmatically with nothing holding a key down, and nothing was
+    // ever calling stop for it — so an auto-opened mic stayed hot forever,
+    // the user's follow-up was captured but never finalized/submitted, and
+    // the conversation died after exactly one turn. Everything below gives an
+    // auto-listen turn its own end-of-speech detection so it behaves like a
+    // real conversational turn instead of a stuck recorder.
+
+    /// Speech-detection threshold for currentAudioPowerLevel (0...1 range,
+    /// see BuddyDictationManager.currentAudioPowerLevel). BuddyDictationManager's
+    /// own silence floor (its private recordedAudioPowerHistoryBaselineLevel)
+    /// is 0.02; this is roughly 2.5x that, so ordinary room tone/hiss can't
+    /// falsely register as "the user started talking." NEEDS LIVE TUNING
+    /// against a real microphone/room.
+    private static let handsFreeSpeechDetectionLevel: CGFloat = 0.05
+
+    /// Once speech has been detected, a sample at or below this level counts
+    /// toward the trailing silence window that ends the turn — close to
+    /// BuddyDictationManager's own silence floor (0.02). Anything strictly
+    /// between this and handsFreeSpeechDetectionLevel is treated as ambiguous
+    /// (quiet talking, not silence): it pauses the silence countdown without
+    /// resetting it. NEEDS LIVE TUNING.
+    private static let handsFreeSilenceLevel: CGFloat = 0.03
+
+    /// How many consecutive above-threshold polls (at the ~100ms interval
+    /// below) are required before a burst counts as "the user started
+    /// talking" — guards against a single noise spike.
+    private static let handsFreeSpeechConfirmationSampleCount = 2
+
+    /// How long the level must stay at/below handsFreeSilenceLevel, after
+    /// speech has started, before the turn is auto-finalized (finalize +
+    /// submit via stopPushToTalkFromKeyboardShortcut()).
+    private static let handsFreeTrailingSilenceDurationSeconds: TimeInterval = 1.5
+
+    /// If no speech is heard at all within this long, give up on the turn —
+    /// treated as silence, so it's discarded (cancelCurrentDictation), not
+    /// submitted.
+    private static let handsFreeNoSpeechTimeoutSeconds: TimeInterval = 8.0
+
+    /// Absolute ceiling on a single auto-listen turn regardless of whether
+    /// speech was heard — a backstop against a stuck-open mic.
+    private static let handsFreeMaxListenDurationSeconds: TimeInterval = 20.0
+
+    /// Poll interval for the monitor below. Task.sleep-based — not a busy-wait.
+    private static let handsFreeMonitorPollIntervalNanoseconds: UInt64 = 100_000_000
+
+    /// A hands-free transcript with fewer words than this is treated as STT
+    /// hallucination on near-silent audio ("you", "thank you") rather than a
+    /// real utterance — see the submit closure in beginVoiceListening below.
+    private static let handsFreeMinimumSpokenWordCount = 2
+
+    /// Same idea in raw non-space character terms, so a single short "word"
+    /// STT split into pieces (or vice versa) is still caught.
+    private static let handsFreeMinimumSpokenNonSpaceCharacterCount = 3
+
+    /// Once this many consecutive hands-free turns in a row produce no real
+    /// speech, scheduleHandsFreeRearmIfNeeded stops re-opening the mic on its
+    /// own (without touching the isHandsFreeEnabled toggle) until the user
+    /// does a manual push-to-talk / Voice-button turn.
+    private static let handsFreeMaxConsecutiveSilentTurns = 3
+
+    /// Starts the voice-activity monitor for an in-progress hands-free
+    /// auto-listen turn — see the MARK section above for why this exists at
+    /// all. Polls buddyDictationManager.currentAudioPowerLevel on the main
+    /// actor roughly every 100ms (Task.sleep, not a tight loop) and:
+    ///   - waits for the level to clear handsFreeSpeechDetectionLevel for
+    ///     handsFreeSpeechConfirmationSampleCount consecutive polls before
+    ///     considering the turn to have started ("heardSpeech"),
+    ///   - once heardSpeech is true, finalizes+submits the turn
+    ///     (stopPushToTalkFromKeyboardShortcut) once the level has stayed at
+    ///     or below handsFreeSilenceLevel continuously for
+    ///     handsFreeTrailingSilenceDurationSeconds,
+    ///   - and otherwise gives up and discards the turn
+    ///     (cancelCurrentDictation(preserveDraftText: false), counted as a
+    ///     silent turn) if no speech is ever heard within
+    ///     handsFreeNoSpeechTimeoutSeconds, or unconditionally once
+    ///     handsFreeMaxListenDurationSeconds elapses regardless of speech.
+    ///
+    /// Only ever called from beginVoiceListening's isHandsFreeAutoListen
+    /// branch. Exits immediately, on every poll, if hands-free was disabled,
+    /// this is no longer the active auto-listen session, a new response task
+    /// started, or the task itself was cancelled — see every cancellation
+    /// site listed on handsFreeListenMonitorTask's declaration.
+    private func startHandsFreeListenMonitor() {
+        handsFreeListenMonitorTask?.cancel()
+        // Explicit @MainActor: the monitor reads/writes main-actor state
+        // (isHandsFreeEnabled, currentResponseTask, buddyDictationManager) across
+        // its await points, so it must resume on the main actor every poll.
+        handsFreeListenMonitorTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            var hasObservedDictationInProgress = false
+            var heardSpeech = false
+            var consecutiveAboveThresholdSamples = 0
+            var silenceStartedAt: Date?
+            let listenStartedAt = Date()
+
+            while !Task.isCancelled {
+                guard self.isHandsFreeEnabled,
+                      self.isHandsFreeAutoListening,
+                      self.currentResponseTask == nil else {
+                    return
+                }
+
+                let dictationInProgress = self.buddyDictationManager.isDictationInProgress
+                if dictationInProgress {
+                    hasObservedDictationInProgress = true
+
+                    let level = self.buddyDictationManager.currentAudioPowerLevel
+                    if level > Self.handsFreeSpeechDetectionLevel {
+                        consecutiveAboveThresholdSamples += 1
+                        silenceStartedAt = nil
+                        if !heardSpeech && consecutiveAboveThresholdSamples >= Self.handsFreeSpeechConfirmationSampleCount {
+                            heardSpeech = true
+                            print("🎙️ Hands-free listen monitor: speech detected, watching for end-of-speech")
+                        }
+                    } else {
+                        consecutiveAboveThresholdSamples = 0
+                        if heardSpeech && level <= Self.handsFreeSilenceLevel {
+                            let silenceStart = silenceStartedAt ?? Date()
+                            silenceStartedAt = silenceStart
+                            if Date().timeIntervalSince(silenceStart) >= Self.handsFreeTrailingSilenceDurationSeconds {
+                                print("🎙️ Hands-free listen monitor: end-of-speech detected, finalizing turn")
+                                self.buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+                                return
+                            }
+                        }
+                        // Else: level is in the ambiguous band between
+                        // handsFreeSilenceLevel and handsFreeSpeechDetectionLevel
+                        // (or speech hasn't started yet) — leave any running
+                        // silence timer paused rather than resetting it.
+                    }
+                } else if hasObservedDictationInProgress {
+                    // Dictation was running and has since ended through some
+                    // other path (an internal STT error/fallback, or a
+                    // teardown that for some reason didn't cancel this task
+                    // directly) — nothing left for this monitor to do.
+                    return
+                }
+
+                let elapsedListenSeconds = Date().timeIntervalSince(listenStartedAt)
+                if !heardSpeech && elapsedListenSeconds >= Self.handsFreeNoSpeechTimeoutSeconds {
+                    print("🎙️ Hands-free listen monitor: no speech within \(Int(Self.handsFreeNoSpeechTimeoutSeconds))s — discarding silent turn")
+                    self.buddyDictationManager.cancelCurrentDictation(preserveDraftText: false)
+                    self.endVoiceListeningSession()
+                    self.scheduleTransientHideIfNeeded()
+                    self.registerHandsFreeSilentTurn()
+                    self.scheduleHandsFreeRearmIfNeeded()
+                    return
+                }
+                if elapsedListenSeconds >= Self.handsFreeMaxListenDurationSeconds {
+                    print("🎙️ Hands-free listen monitor: max listen duration reached — ending turn")
+                    if heardSpeech {
+                        self.buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+                    } else {
+                        self.buddyDictationManager.cancelCurrentDictation(preserveDraftText: false)
+                        self.endVoiceListeningSession()
+                        self.scheduleTransientHideIfNeeded()
+                        self.registerHandsFreeSilentTurn()
+                        self.scheduleHandsFreeRearmIfNeeded()
+                    }
+                    return
+                }
+
+                try? await Task.sleep(nanoseconds: Self.handsFreeMonitorPollIntervalNanoseconds)
+            }
+        }
+    }
+
+    /// Records that a hands-free auto-listen turn ended without a real,
+    /// submittable utterance — either startHandsFreeListenMonitor's
+    /// no-speech/max-listen backstop discarded a silent turn, or the submit
+    /// closure in beginVoiceListening caught a trivially short transcript.
+    /// scheduleHandsFreeRearmIfNeeded consults this count and suspends
+    /// auto-rearming once it reaches handsFreeMaxConsecutiveSilentTurns, so a
+    /// noisy room can't loop the mic open forever.
+    private func registerHandsFreeSilentTurn() {
+        handsFreeConsecutiveSilentTurns += 1
+        print("🎙️ Hands-free: silent/trivial turn #\(handsFreeConsecutiveSilentTurns) in a row")
+    }
+
+    /// Clears the silent-turn streak. Called whenever a real utterance is
+    /// submitted — a genuine hands-free turn, or any manual push-to-talk /
+    /// Voice-button turn — since either proves the user is actually there.
+    private func resetHandsFreeSilentTurnCounter() {
+        handsFreeConsecutiveSilentTurns = 0
+    }
+
+    /// True if `transcript`, once trimmed, is too short to plausibly be a
+    /// real spoken turn — fewer than handsFreeMinimumSpokenWordCount words,
+    /// or fewer than handsFreeMinimumSpokenNonSpaceCharacterCount non-space
+    /// characters. Speech-to-text reliably hallucinates short junk like "you"
+    /// or "thank you" on near-silent audio; this heuristic keeps a hands-free
+    /// auto-listen from submitting that noise as a real message (see the
+    /// submit closure in beginVoiceListening below).
+    private static func isTriviallyShortHandsFreeTranscript(_ transcript: String) -> Bool {
+        let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nonSpaceCharacterCount = trimmedTranscript.filter { !$0.isWhitespace }.count
+        guard nonSpaceCharacterCount >= Self.handsFreeMinimumSpokenNonSpaceCharacterCount else { return true }
+        let wordCount = trimmedTranscript.split(whereSeparator: { $0.isWhitespace }).count
+        return wordCount < Self.handsFreeMinimumSpokenWordCount
+    }
+
+    /// Starts listening for one spoken turn: barge-in (cancels whatever the
+    /// agent is currently saying/generating), flags `isRecordingVoiceFollowUp`,
+    /// brings up the cursor overlay if it's hidden, and starts a push-to-talk
+    /// dictation session through the SAME machinery the hardware shortcut uses.
+    /// On a final transcript, sends it through the normal response path
+    /// attached to `agentTaskID` (nil routes to the main chat, with no
+    /// specific task card).
+    ///
+    /// This is the single primitive both toggleVoiceFollowUp (the Agents tab's
+    /// manual Voice button) and hands-free conversation mode's automatic
+    /// re-arm (scheduleHandsFreeRearmIfNeeded above) use to open the mic for a
+    /// turn — do NOT duplicate this barge-in/dictation logic anywhere else.
+    ///
+    /// - Parameter isHandsFreeAutoListen: true only when this call is the
+    ///   hands-free re-arm opening the mic automatically, as opposed to the
+    ///   user tapping a Voice button. Recorded on isHandsFreeAutoListening so
+    ///   setHandsFreeEnabled(false) can tell an auto-opened mic apart from a
+    ///   manually-started one and only stop the former.
+    private func beginVoiceListening(forAgentTaskID agentTaskID: UUID?, isHandsFreeAutoListen: Bool = false) {
         // Don't start if another dictation (e.g. the hardware shortcut) is busy.
         guard !buddyDictationManager.isDictationInProgress else { return }
 
@@ -1269,10 +1726,26 @@ final class CompanionManager: ObservableObject {
         // cancelled turn can't wedge the pipeline at .responding. This spoken
         // request takes over right away; any typed follow-ups the user queued stay
         // queued and run after this voice turn. (Mirrors the hardware push-to-talk
-        // path, which also interrupts on press.)
+        // path, which also interrupts on press.) For a hands-free re-arm there is
+        // nothing in flight to cancel at this point — the settle block only
+        // schedules the re-arm once the pipeline is already idle — so this is a
+        // harmless no-op in that case. This also tears down any monitor task
+        // left over from a superseded auto-listen turn (see
+        // handsFreeListenMonitorTask).
         cancelInFlightResponseForBargeIn()
 
         isRecordingVoiceFollowUp = true
+        isHandsFreeAutoListening = isHandsFreeAutoListen
+
+        // Only a hands-free auto-listen needs its own end-of-speech detection
+        // — the hardware shortcut and the manual Voice button are both held
+        // open by an explicit user action and stopped by an explicit
+        // release/tap, so neither of them needs this. See
+        // startHandsFreeListenMonitor's doc comment (and the MARK section
+        // above it) for why an auto-opened mic would otherwise never close.
+        if isHandsFreeAutoListen {
+            startHandsFreeListenMonitor()
+        }
 
         // Bring the cursor overlay up transiently so the waveform is visible,
         // matching the hardware push-to-talk experience.
@@ -1282,18 +1755,41 @@ final class CompanionManager: ObservableObject {
             isOverlayVisible = true
         }
 
-        Task {
-            await buddyDictationManager.startPushToTalkFromKeyboardShortcut(
+        Task { [weak self] in
+            guard let self else { return }
+            await self.buddyDictationManager.startPushToTalkFromKeyboardShortcut(
                 currentDraftText: "",
                 updateDraftText: { _ in
                     // Partial transcripts are hidden (waveform-only UI).
                 },
                 submitDraftText: { [weak self] finalTranscript in
                     guard let self else { return }
-                    self.isRecordingVoiceFollowUp = false
+                    self.endVoiceListeningSession()
                     self.lastTranscript = finalTranscript
+
+                    // Loop / silence-hallucination protection: STT reliably
+                    // hallucinates short junk ("you", "thank you") on near-
+                    // silent audio, which would otherwise submit, get a
+                    // reply, and re-arm the mic — looping forever on
+                    // background noise. Only hands-free's own auto-listen
+                    // turns are filtered like this; a manual Voice-button
+                    // turn (or the hardware push-to-talk shortcut, handled
+                    // separately in handleShortcutTransition) is never
+                    // dropped, since the user explicitly chose to speak.
+                    if isHandsFreeAutoListen && Self.isTriviallyShortHandsFreeTranscript(finalTranscript) {
+                        print("🎙️ Hands-free: dropping trivial transcript \"\(finalTranscript)\" as likely silence/hallucination")
+                        self.registerHandsFreeSilentTurn()
+                        self.scheduleHandsFreeRearmIfNeeded()
+                        return
+                    }
+
+                    // A real utterance — resets the silent-turn streak,
+                    // whether this was a hands-free turn or a manual one.
+                    self.resetHandsFreeSilentTurnCounter()
+
                     ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
-                    // Attach the follow-up to the task captured at button-tap time.
+                    // Attach the follow-up to the task captured at button-tap
+                    // time (nil for hands-free re-arm / main chat).
                     self.sendTranscriptToClaudeWithScreenshot(
                         transcript: finalTranscript,
                         associatedAgentTaskID: agentTaskID
@@ -1303,9 +1799,9 @@ final class CompanionManager: ObservableObject {
 
             // If the session never actually began (permission denied, recognition
             // error, cancelled, or superseded), the submit closure won't run — roll
-            // back the optimistic flag so the Voice button isn't stuck recording.
+            // back the optimistic flags so the Voice button isn't stuck recording.
             if !self.buddyDictationManager.isDictationInProgress && self.isRecordingVoiceFollowUp {
-                self.isRecordingVoiceFollowUp = false
+                self.endVoiceListeningSession()
                 self.scheduleTransientHideIfNeeded()
                 // The voice follow-up never produced a turn, so the pipeline may
                 // be idle now — drain any typed follow-up queued behind it.
