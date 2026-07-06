@@ -363,6 +363,13 @@ final class CompanionManager: ObservableObject {
     /// speaking, so it can never hear its own voice.
     @Published var isHandsFreeEnabled: Bool = UserDefaults.standard.bool(forKey: "isHandsFreeConversationEnabled")
 
+    /// Whether the current hands-free conversation should keep re-opening the
+    /// mic. This is intentionally separate from the persisted feature toggle:
+    /// saying an explicit end phrase stops the current conversation without
+    /// turning the feature off. The next manual voice turn starts a fresh
+    /// conversation automatically.
+    @Published private(set) var isHandsFreeSessionActive = false
+
     /// Mirrors setClickyCursorEnabled's shape exactly: update the published
     /// flag, then persist it. Disabling mid-conversation additionally cancels
     /// any pending re-arm (so it can never fire after this) and, if hands-free
@@ -382,8 +389,15 @@ final class CompanionManager: ObservableObject {
     func setHandsFreeEnabled(_ enabled: Bool) {
         isHandsFreeEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: "isHandsFreeConversationEnabled")
-        guard !enabled else { return }
+        if enabled {
+            // Enabling makes hands-free available, but a manual voice turn is
+            // what starts a conversation. This prevents a stale reply or task
+            // from opening the mic merely because the preference was toggled.
+            isHandsFreeSessionActive = false
+            return
+        }
 
+        isHandsFreeSessionActive = false
         handsFreeRearmTask?.cancel()
         handsFreeRearmTask = nil
         handsFreeListenMonitorTask?.cancel()
@@ -576,6 +590,9 @@ final class CompanionManager: ObservableObject {
         handsFreeRearmTask = nil
         handsFreeListenMonitorTask?.cancel()
         handsFreeListenMonitorTask = nil
+        isHandsFreeSessionActive = false
+        isHandsFreeAutoListening = false
+        isRecordingVoiceFollowUp = false
 
         currentResponseTask?.cancel()
         currentResponseTask = nil
@@ -853,6 +870,18 @@ final class CompanionManager: ObservableObject {
                     submitDraftText: { [weak self] finalTranscript in
                         guard let self else { return }
                         self.lastTranscript = finalTranscript
+                        if Self.shouldEndHandsFreeConversation(
+                            transcript: finalTranscript,
+                            isEnabled: self.isHandsFreeEnabled,
+                            isSessionActive: self.isHandsFreeSessionActive,
+                            isAutoListening: false
+                        ) {
+                            self.endHandsFreeConversation()
+                            return
+                        }
+                        if self.isHandsFreeEnabled {
+                            self.isHandsFreeSessionActive = true
+                        }
                         // A real, manually-spoken turn — clears any streak of
                         // silent/trivial hands-free auto-listen turns that
                         // may have built up (see handsFreeConsecutiveSilentTurns),
@@ -1348,6 +1377,7 @@ final class CompanionManager: ObservableObject {
         handsFreeListenMonitorTask = nil
 
         guard isHandsFreeEnabled else { return }
+        guard isHandsFreeSessionActive else { return }
         // A queued typed follow-up drained above already started a new turn —
         // don't stack a re-arm on top of it.
         guard currentResponseTask == nil else { return }
@@ -1386,6 +1416,7 @@ final class CompanionManager: ObservableObject {
             // there's any doubt at all, skip the re-arm rather than risk
             // capturing Micky's own voice or stepping on something else.
             guard self.isHandsFreeEnabled else { return }
+            guard self.isHandsFreeSessionActive else { return }
             guard self.currentResponseTask == nil else { return }
             guard !self.isRecordingVoiceFollowUp, !self.buddyDictationManager.isDictationInProgress else { return }
             guard !self.textToSpeechClient.isPlaying else { return }
@@ -1595,6 +1626,7 @@ final class CompanionManager: ObservableObject {
 
             while !Task.isCancelled {
                 guard self.isHandsFreeEnabled,
+                      self.isHandsFreeSessionActive,
                       self.isHandsFreeAutoListening,
                       self.currentResponseTask == nil else {
                     return
@@ -1699,6 +1731,68 @@ final class CompanionManager: ObservableObject {
         return wordCount < Self.handsFreeMinimumSpokenWordCount
     }
 
+    /// Exact, assistant-addressed phrases that end the current hands-free
+    /// conversation. Matching is deliberately strict so ordinary sentences
+    /// containing "stop", "done", or "thanks" never shut the mic loop down.
+    /// Punctuation and apostrophe style are ignored by normalization.
+    static func isHandsFreeConversationEndTranscript(_ transcript: String) -> Bool {
+        let apostropheNormalized = transcript
+            .lowercased()
+            // STT transcribes the wake-name as "Mickey" (the common English
+            // spelling) about as often as "Micky" — fold both to one form so
+            // every end phrase matches regardless of which the recognizer picked.
+            .replacingOccurrences(of: "mickey", with: "micky")
+            .replacingOccurrences(of: "’", with: "'")
+            .replacingOccurrences(of: "'", with: "")
+        let wordsOnly = apostropheNormalized.unicodeScalars.map { scalar -> Character in
+            CharacterSet.alphanumerics.contains(scalar) ? Character(String(scalar)) : " "
+        }
+        let normalized = String(wordsOnly)
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+
+        return [
+            "thats all micky",
+            "that is all micky",
+            "micky thats all",
+            "micky that is all",
+            "end conversation micky",
+            "stop listening micky",
+            "goodbye micky",
+        ].contains(normalized)
+    }
+
+    /// Session policy around the phrase matcher. The phrase is consumed only
+    /// when hands-free is enabled and a conversation is already active (or the
+    /// transcript came from the auto-opened microphone). A first, unrelated
+    /// push-to-talk saying "goodbye Micky" therefore still reaches the model.
+    static func shouldEndHandsFreeConversation(
+        transcript: String,
+        isEnabled: Bool,
+        isSessionActive: Bool,
+        isAutoListening: Bool
+    ) -> Bool {
+        guard isEnabled, isSessionActive || isAutoListening else { return false }
+        return isHandsFreeConversationEndTranscript(transcript)
+    }
+
+    /// Stop only the current automatic conversation loop. The persisted
+    /// hands-free preference remains enabled, so a later manual push-to-talk
+    /// turn can begin a new conversation without visiting Settings.
+    private func endHandsFreeConversation() {
+        isHandsFreeSessionActive = false
+        handsFreeRearmTask?.cancel()
+        handsFreeRearmTask = nil
+        handsFreeListenMonitorTask?.cancel()
+        handsFreeListenMonitorTask = nil
+        if isHandsFreeAutoListening && buddyDictationManager.isDictationInProgress {
+            buddyDictationManager.cancelCurrentDictation(preserveDraftText: false)
+            endVoiceListeningSession()
+        }
+        print("🎙️ Hands-free: conversation ended by voice phrase")
+        scheduleTransientHideIfNeeded()
+    }
+
     /// Starts listening for one spoken turn: barge-in (cancels whatever the
     /// agent is currently saying/generating), flags `isRecordingVoiceFollowUp`,
     /// brings up the cursor overlay if it's hidden, and starts a push-to-talk
@@ -1767,6 +1861,16 @@ final class CompanionManager: ObservableObject {
                     self.endVoiceListeningSession()
                     self.lastTranscript = finalTranscript
 
+                    if Self.shouldEndHandsFreeConversation(
+                        transcript: finalTranscript,
+                        isEnabled: self.isHandsFreeEnabled,
+                        isSessionActive: self.isHandsFreeSessionActive,
+                        isAutoListening: isHandsFreeAutoListen
+                    ) {
+                        self.endHandsFreeConversation()
+                        return
+                    }
+
                     // Loop / silence-hallucination protection: STT reliably
                     // hallucinates short junk ("you", "thank you") on near-
                     // silent audio, which would otherwise submit, get a
@@ -1785,6 +1889,9 @@ final class CompanionManager: ObservableObject {
 
                     // A real utterance — resets the silent-turn streak,
                     // whether this was a hands-free turn or a manual one.
+                    if self.isHandsFreeEnabled {
+                        self.isHandsFreeSessionActive = true
+                    }
                     self.resetHandsFreeSilentTurnCounter()
 
                     ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)

@@ -720,7 +720,11 @@ struct CompanionPanelView: View {
                     Text("Hands-free conversation")
                         .font(.system(size: 13, weight: .medium))
                         .foregroundColor(DS.Colors.textSecondary)
-                    Text("Micky reopens the mic after replying, so you can talk back without holding a key.")
+                    Text(
+                        companionManager.isHandsFreeSessionActive
+                            ? "Conversation active · Say “that’s all, Micky” to end it."
+                            : "Ready · Start a conversation with push-to-talk."
+                    )
                         .font(.system(size: 10))
                         .foregroundColor(DS.Colors.textTertiary)
                 }
