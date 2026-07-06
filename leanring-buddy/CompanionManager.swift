@@ -126,8 +126,19 @@ final class CompanionManager: ObservableObject {
     /// updates.
     private var agentTaskStoreChangeCancellable: AnyCancellable?
 
+    /// Forwards the Integrations store's changes the same way
+    /// agentTaskStoreChangeCancellable does above — IntegrationsTabView
+    /// observes it directly as its own @ObservedObject, but this keeps
+    /// CompanionManager itself a complete source of truth for anything else
+    /// that reads `integrationsStore` off of it.
+    private var integrationsStoreChangeCancellable: AnyCancellable?
+
     init() {
         agentTaskStoreChangeCancellable = agentTaskStore.objectWillChange
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+        integrationsStoreChangeCancellable = integrationsStore.objectWillChange
             .sink { [weak self] _ in
                 self?.objectWillChange.send()
             }
@@ -157,6 +168,16 @@ final class CompanionManager: ObservableObject {
     private lazy var agentArtifactsService: AgentArtifactsService = {
         return AgentArtifactsService(proxyBaseURL: Self.workerBaseURL)
     }()
+
+    /// Centralized store for the Integrations tab: the connected/
+    /// initializing/available catalog partitioning, debounced app search, and
+    /// the connect→browser→refresh flow. Lives here (like agentTaskStore
+    /// above) so the tab's state survives every open/close of the panel, not
+    /// just while the tab happens to be selected. Nothing here talks to the
+    /// proxy until the tab is opened once — see IntegrationsStore.onTabAppear.
+    let integrationsStore: IntegrationsStore = IntegrationsStore(
+        service: IntegrationsService(proxyBaseURL: CompanionManager.workerBaseURL)
+    )
 
     /// Drives the proactive-suggestion HUD: a dwell timer that watches the
     /// frontmost app and, once enabled, asks the proxy's /proactive-intents

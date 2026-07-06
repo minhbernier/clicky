@@ -10,10 +10,11 @@
 import AVFoundation
 import SwiftUI
 
-/// The two top-level tabs in the menu bar panel.
+/// The top-level tabs in the menu bar panel.
 enum CompanionPanelTab {
     case home
     case agents
+    case integrations
 }
 
 struct CompanionPanelView: View {
@@ -49,6 +50,8 @@ struct CompanionPanelView: View {
 
             if shouldShowTabs && selectedTab == .agents {
                 agentsTabContent
+            } else if shouldShowTabs && selectedTab == .integrations {
+                integrationsTabContent
             } else {
                 homeTabContent
             }
@@ -74,6 +77,7 @@ struct CompanionPanelView: View {
         HStack(spacing: 4) {
             tabButton(title: "Home", tab: .home)
             tabButton(title: "Agents", tab: .agents)
+            tabButton(title: "Integrations", tab: .integrations)
             Spacer()
         }
     }
@@ -1206,6 +1210,20 @@ struct CompanionPanelView: View {
         guard isAgentFollowUpSendable else { return }
         companionManager.sendFollowUpText(agentFollowUpText, toAgentTaskID: agentTask.id)
         agentFollowUpText = ""
+    }
+
+    // MARK: - Integrations Tab
+
+    /// Renders the searchable Integrations catalog. The actual layout lives in
+    /// IntegrationsTabView (its own file, like ConnectorRecommendationView)
+    /// since it owns a fair amount of self-contained content — search field,
+    /// three sections, loading/retry states. This just hands it the shared
+    /// per-app store so the tab's search query and catalog partitioning
+    /// survive every open/close of the panel, not just while the tab is
+    /// selected. IntegrationsTabView's own `.onAppear` triggers the first
+    /// fetch — nothing about this tab runs before the user opens it.
+    private var integrationsTabContent: some View {
+        IntegrationsTabView(store: companionManager.integrationsStore)
     }
 
     // MARK: - Visual Helpers
