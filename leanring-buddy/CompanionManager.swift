@@ -220,6 +220,16 @@ final class CompanionManager: ObservableObject {
         )
     }()
 
+    /// Speaks a morning news briefing on the first activity of the day after an
+    /// overnight idle gap. Self-gating (enabled flag + morning window + once/day),
+    /// so it's simply started once at launch; reuses the shared TTS client.
+    private lazy var morningBriefingManager: MorningBriefingManager = {
+        return MorningBriefingManager(
+            proxyBaseURL: Self.workerBaseURL,
+            tts: textToSpeechClient
+        )
+    }()
+
     /// Conversation history so Claude remembers prior exchanges within a session.
     /// Each entry is the user's transcript and Claude's response.
     private var conversationHistory: [(userTranscript: String, assistantResponse: String)] = []
@@ -504,6 +514,11 @@ final class CompanionManager: ObservableObject {
         if isProactiveEnabled {
             proactiveManager.start()
         }
+
+        // Start the morning-briefing observers. Unlike proactive, this is
+        // enabled by default and self-gates (morning window + once/day + idle
+        // gap), so it simply starts once at launch.
+        morningBriefingManager.start()
     }
 
     /// Called by BlueCursorView after the buddy finishes its pointing
